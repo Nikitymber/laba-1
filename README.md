@@ -1,65 +1,46 @@
-import requests
-import pandas as pd
-import xml.etree.ElementTree as ET
+import os
+import subprocess
+import urllib.request
+from pathlib import Path
 
-date_start = "01/01/2025"
-date_end = "13/10/2026"
+# Получаем адрес корпоративного прокси
+proxy_url = urllib.request.getproxies()["https"]
 
-currencies = {
-    "USD": "R01235",
-    "EUR": "R01239",
-    "CNY": "R01375"
-}
+# Куда сохранить XML
+output_file = Path.cwd() / "cbr_test.xml"
 
-session = requests.Session()
-session.trust_env = False
+ps_script = r"""
+$ErrorActionPreference = "Stop"
 
-dfs = []
+$proxy = New-Object System.Net.WebProxy($env:CBR_PROXY)
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
 
-for currency, currency_id in currencies.items():
+$client = New-Object System.Net.WebClient
+$client.Proxy = $proxy
 
-    url = "http://www.cbr.ru/scripts/XML_dynamic.asp"
+$client.DownloadFile(
+    "https://www.cbr.ru/scripts/XML_daily.asp",
+    $env:CBR_OUTPUT
+)
 
-    params = {
-        "date_req1": date_start,
-        "date_req2": date_end,
-        "VAL_NM_RQ": currency_id
-    }
+Write-Output "OK"
+"""
 
-    response = session.get(
-        url,
-        params=params,
-        timeout=30
-    )
+env = os.environ.copy()
+env["CBR_PROXY"] = proxy_url
+env["CBR_OUTPUT"] = str(output_file)
 
-    response.raise_for_status()
+result = subprocess.run(
+    ["powershell.exe", "-NoProfile", "-Command", ps_script],
+    capture_output=True,
+    text=True,
+    env=env,
+    timeout=45
+)
 
-    root = ET.fromstring(response.content)
+print("Код завершения:", result.returncode)
+print("Результат:", result.stdout)
+print("Ошибка:", result.stderr)
 
-    data = []
-
-    for record in root.findall("Record"):
-
-        date = pd.to_datetime(
-            record.attrib["Date"],
-            format="%d.%m.%Y"
-        )
-
-        nominal = float(
-            record.findtext("Nominal").replace(",", ".")
-        )
-
-        value = float(
-            record.findtext("Value").replace(",", ".")
-        )
-
-        data.append({
-            "date": date,
-            currency: value / nominal
-        })
-
-    dfs.append(pd.DataFrame(data).set_index("date"))
-
-rates_df = pd.concat(dfs, axis=1).sort_index()
-
-print(rates_df.tail())
+if result.returncode == 0:
+    print("Файл сохранён:", output_file)
