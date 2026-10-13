@@ -1,0 +1,230 @@
+
+import os
+import subprocess
+import urllib.request
+import xml.etree.ElementTree as ET
+import tempfile
+import math
+
+from pathlib import Path
+from urllib.parse import urlencode
+
+import pandas as pd
+
+# =====================================================
+# 1. Параметры
+# =====================================================
+
+report_date = "12.10.2026"
+
+currencies = ["USD", "EUR", "CNY"]
+
+# Проверяем формат даты
+target_date = pd.to_datetime(
+    report_date,
+    format="%d.%m.%Y"
+)
+
+# Получаем корпоративный прокси
+proxy_url = urllib.request.getproxies().get("https")
+
+if not proxy_url:
+    raise RuntimeError("Не найден корпоративный HTTPS-прокси")
+
+# =====================================================
+# 2. PowerShell для загрузки XML
+# =====================================================
+
+ps_script = r"""
+$ErrorActionPreference = "Stop";
+
+$proxy = [System.Net.WebProxy]::new($env:CBR_PROXY);
+
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+
+$client.Proxy = $proxy;
+
+$client.DownloadFile(
+    $env:CBR_URL,
+    $env:CBR_OUTPUT
+);
+
+Write-Output "OK";
+"""
+
+# =====================================================
+# 3. Функция загрузки курсов на одну дату
+# =====================================================
+
+def get_currency_rates(report_date, currencies):
+
+    # Формируем URL
+    params = {
+        "date_req": report_date.replace(".", "/")
+    }
+
+    url = (
+        "https://www.cbr.ru/scripts/XML_daily.asp?"
+        + urlencode(params)
+    )
+
+    # Временный файл XML
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        output_file = Path(temp_dir) / "CBR_daily.xml"
+
+        env = os.environ.copy()
+
+        env["CBR_PROXY"] = proxy_url
+        env["CBR_URL"] = url
+        env["CBR_OUTPUT"] = str(output_file)
+
+        # Загружаем XML
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                ps_script
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=90
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Ошибка загрузки:\n{result.stderr}"
+            )
+
+        if not output_file.exists():
+            raise FileNotFoundError("XML-файл не загружен")
+
+        # Читаем XML
+        root = ET.parse(output_file).getroot()
+
+    if root.tag != "ValCurs":
+        raise ValueError("Некорректный XML-ответ ЦБ РФ")
+
+    # =================================================
+    # 4. Проверяем дату полученных курсов
+    # =================================================
+
+    xml_date = root.attrib.get("Date")
+
+    if not xml_date:
+        raise ValueError("В XML отсутствует дата курсов")
+
+    actual_date = pd.to_datetime(
+        xml_date,
+        format="%d.%m.%Y"
+    )
+
+    requested_date = pd.to_datetime(
+        report_date,
+        format="%d.%m.%Y"
+    )
+
+    print(f"Запрошенная дата: {requested_date:%d.%m.%Y}")
+    print(f"Дата курсов ЦБ:   {actual_date:%d.%m.%Y}")
+
+    if actual_date > requested_date:
+        raise ValueError(
+            "Дата курсов ЦБ позже запрошенной даты"
+        )
+
+    if actual_date < requested_date:
+        print(
+            "Внимание: используются последние "
+            "действовавшие курсы на запрошенную дату"
+        )
+
+    # =================================================
+    # 5. Парсим котировки
+    # =================================================
+
+    rates = {currency: float("nan") for currency in currencies}
+
+    for valute in root.findall("Valute"):
+
+        code = valute.findtext("CharCode")
+
+        if code not in rates:
+            continue
+
+        try:
+            nominal = float(
+                valute.findtext("Nominal").replace(",", ".")
+            )
+
+            value = float(
+                valute.findtext("Value").replace(",", ".")
+            )
+
+            rate = value / nominal
+
+            if not math.isfinite(rate) or rate <= 0:
+                raise ValueError("Некорректный курс")
+
+            rates[code] = rate
+
+        except (AttributeError, ValueError, ZeroDivisionError):
+            print(f"Некорректная котировка: {code}")
+
+    # =================================================
+    # 6. Проверка наличия котировок
+    # =================================================
+
+    missing = [
+        currency
+        for currency in currencies
+        if pd.isna(rates[currency])
+    ]
+
+    if len(missing) == len(currencies):
+        raise ValueError(
+            "Не найдена ни одна из запрошенных котировок"
+        )
+
+    if missing:
+        print(
+            "Отсутствуют котировки:",
+            ", ".join(missing)
+        )
+
+    # =================================================
+    # 7. Формируем DataFrame
+    # =================================================
+
+    rates_df = pd.DataFrame([{
+        "date": requested_date,
+        **rates
+    }])
+
+    return rates_df
+
+
+# =====================================================
+# 8. Загрузка данных
+# =====================================================
+
+rates_df = get_currency_rates(
+    report_date,
+    currencies
+)
+
+# =====================================================
+# 9. Сохранение результата
+# =====================================================
+
+rates_df.to_excel(
+    "CBR_currency_rates.xlsx",
+    index=False
+)
+
+print("\nПолученные котировки:")
+print(rates_df)
