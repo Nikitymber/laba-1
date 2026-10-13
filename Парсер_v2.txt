@@ -1,0 +1,146 @@
+
+import os
+import subprocess
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urlencode
+
+import pandas as pd
+
+# =====================================================
+# 1. Параметры
+# =====================================================
+
+date_start = "01/01/2025"
+date_end = "13/10/2026"
+
+currencies = {
+    "USD": "R01235",
+    "EUR": "R01239",
+    "CNY": "R01375"
+}
+
+proxy_url = urllib.request.getproxies()["https"]
+
+# =====================================================
+# 2. PowerShell для загрузки XML
+# =====================================================
+
+ps_script = r"""
+$ErrorActionPreference = "Stop";
+
+$proxy = [System.Net.WebProxy]::new($env:CBR_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+
+$client.DownloadFile(
+    $env:CBR_URL,
+    $env:CBR_OUTPUT
+);
+
+Write-Output "OK";
+"""
+
+# =====================================================
+# 3. Функция загрузки исторических курсов
+# =====================================================
+
+def get_currency_history(currency, currency_id):
+
+    params = {
+        "date_req1": date_start,
+        "date_req2": date_end,
+        "VAL_NM_RQ": currency_id
+    }
+
+    url = (
+        "https://www.cbr.ru/scripts/XML_dynamic.asp?"
+        + urlencode(params)
+    )
+
+    output_file = Path.cwd() / f"CBR_{currency}.xml"
+
+    env = os.environ.copy()
+
+    env["CBR_PROXY"] = proxy_url
+    env["CBR_URL"] = url
+    env["CBR_OUTPUT"] = str(output_file)
+
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=90
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Ошибка загрузки {currency}: {result.stderr}"
+        )
+
+    # Парсим XML
+    root = ET.parse(output_file).getroot()
+
+    data = []
+
+    for record in root.findall("Record"):
+
+        date = pd.to_datetime(
+            record.attrib["Date"],
+            format="%d.%m.%Y"
+        )
+
+        nominal = float(
+            record.findtext("Nominal").replace(",", ".")
+        )
+
+        value = float(
+            record.findtext("Value").replace(",", ".")
+        )
+
+        data.append({
+            "date": date,
+            currency: value / nominal
+        })
+
+    if not data:
+        raise ValueError(
+            f"Нет данных для {currency} за указанный период"
+        )
+
+    return pd.DataFrame(data).set_index("date")
+
+
+# =====================================================
+# 4. Загружаем валюты
+# =====================================================
+
+dfs = []
+
+for currency, currency_id in currencies.items():
+
+    print(f"Загрузка {currency}...")
+
+    df = get_currency_history(currency, currency_id)
+
+    dfs.append(df)
+
+# =====================================================
+# 5. Объединяем данные
+# =====================================================
+
+rates_df = pd.concat(dfs, axis=1).sort_index()
+
+rates_df.index.name = "date"
+
+# =====================================================
+# 6. Сохраняем результат
+# =====================================================
+
+rates_df.to_excel("CBR_currency_rates.xlsx")
+
+print(rates_df.tail())
