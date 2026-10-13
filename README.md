@@ -3,35 +3,46 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-# Получаем адрес корпоративного прокси
+# Получаем корпоративный прокси
 proxy_url = urllib.request.getproxies()["https"]
 
-# Куда сохранить XML
+# Файл для сохранения
 output_file = Path.cwd() / "cbr_test.xml"
 
+# PowerShell-скрипт
 ps_script = r"""
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop";
 
-$proxy = New-Object System.Net.WebProxy($env:CBR_PROXY)
-$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+$proxy = [System.Net.WebProxy]::new($env:CBR_PROXY);
 
-$client = New-Object System.Net.WebClient
-$client.Proxy = $proxy
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+
+$client.Proxy = $proxy;
 
 $client.DownloadFile(
     "https://www.cbr.ru/scripts/XML_daily.asp",
     $env:CBR_OUTPUT
-)
+);
 
-Write-Output "OK"
+Write-Output "OK";
 """
 
+# Передаём параметры
 env = os.environ.copy()
+
 env["CBR_PROXY"] = proxy_url
 env["CBR_OUTPUT"] = str(output_file)
 
+# Запускаем PowerShell
 result = subprocess.run(
-    ["powershell.exe", "-NoProfile", "-Command", ps_script],
+    [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        ps_script
+    ],
     capture_output=True,
     text=True,
     env=env,
@@ -42,5 +53,6 @@ print("Код завершения:", result.returncode)
 print("Результат:", result.stdout)
 print("Ошибка:", result.stderr)
 
-if result.returncode == 0:
-    print("Файл сохранён:", output_file)
+if result.returncode == 0 and output_file.exists():
+    print("XML успешно загружен!")
+    print("Путь:", output_file)
