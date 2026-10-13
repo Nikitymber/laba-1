@@ -1,0 +1,102 @@
+
+import requests
+import pandas as pd
+import xml.etree.ElementTree as ET
+
+# =====================================================
+# 1. Параметры
+# =====================================================
+
+date_start = "01.01.2025"
+date_end = "13.10.2026"
+
+currencies = {
+    "USD": "R01235",
+    "EUR": "R01239",
+    "CNY": "R01375"
+}
+
+# =====================================================
+# 2. Функция загрузки исторических курсов
+# =====================================================
+
+def get_currency_history(currency_id, date_start, date_end):
+
+    url = "https://www.cbr.ru/scripts/XML_dynamic.asp"
+
+    params = {
+        "date_req1": date_start.replace(".", "/"),
+        "date_req2": date_end.replace(".", "/"),
+        "VAL_NM_RQ": currency_id
+    }
+
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
+
+    data = []
+
+    for record in root.findall("Record"):
+
+        date = record.attrib["Date"]
+
+        nominal = float(
+            record.findtext("Nominal").replace(",", ".")
+        )
+
+        value = float(
+            record.findtext("Value").replace(",", ".")
+        )
+
+        data.append({
+            "date": pd.to_datetime(date, format="%d.%m.%Y"),
+            "rate": value / nominal
+        })
+
+    df = pd.DataFrame(data, columns=["date", "rate"])
+
+    return df.set_index("date")
+
+
+# =====================================================
+# 3. Загрузка всех валют
+# =====================================================
+
+rates = []
+
+for currency, currency_id in currencies.items():
+
+    df = get_currency_history(
+        currency_id,
+        date_start,
+        date_end
+    )
+
+    df = df.rename(columns={"rate": currency})
+
+    rates.append(df)
+
+
+# =====================================================
+# 4. Объединение данных
+# =====================================================
+
+rates_df = pd.concat(rates, axis=1)
+
+rates_df = rates_df.sort_index()
+
+rates_df.index.name = "date"
+
+# =====================================================
+# 5. Сохранение
+# =====================================================
+
+rates_df.to_excel("CBR_currency_rates.xlsx")
+
+rates_df.to_csv(
+    "CBR_currency_rates.csv",
+    encoding="utf-8-sig"
+)
+
+print(rates_df.tail())
