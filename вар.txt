@@ -1,0 +1,194 @@
+
+import pandas as pd
+import numpy as np
+
+# =====================================================
+# 1. Подготовка fair_value по ISIN
+# =====================================================
+
+fin = fin_inv[["ISIN", "fair_value"]].copy()
+
+fin["ISIN"] = fin["ISIN"].astype(str).str.strip()
+
+fin["fair_value"] = pd.to_numeric(
+    fin["fair_value"].astype(str).str.replace(",", ".", regex=False),
+    errors="coerce"
+)
+
+# Проверяем корректность fair_value
+if fin["fair_value"].isna().any():
+    raise ValueError("В fin_inv есть некорректные fair_value")
+
+# Если один ISIN встречается несколько раз,
+# суммируем его справедливую стоимость
+fair_values = fin.groupby("ISIN")["fair_value"].sum()
+
+
+# =====================================================
+# 2. Функция подготовки котировок
+# =====================================================
+
+def prepare_quotes(df):
+
+    quotes = df.copy()
+    quotes.columns = quotes.columns.astype(str).str.strip()
+
+    # Дата может находиться в колонке или индексе
+    if "Дата" in quotes.columns:
+        quotes = quotes.set_index("Дата")
+
+    elif "date" in quotes.columns:
+        quotes = quotes.set_index("date")
+
+    quotes.index = pd.to_datetime(
+        quotes.index,
+        dayfirst=True,
+        errors="coerce"
+    )
+
+    quotes = quotes.loc[quotes.index.notna()]
+    quotes = quotes.sort_index()
+
+    # Приводим котировки к числовому типу
+    quotes = quotes.apply(
+        lambda col: pd.to_numeric(
+            col.astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
+    )
+
+    # Нулевые, отрицательные и бесконечные котировки
+    # считаем отсутствующими
+    quotes = quotes.replace([np.inf, -np.inf], np.nan)
+    quotes = quotes.where(quotes > 0)
+
+    # Убираем повторяющиеся даты
+    quotes = quotes.groupby(level=0).last()
+
+    return quotes
+
+
+bonds_prices = prepare_quotes(var_bonds)
+stocks_prices = prepare_quotes(var_stocks)
+
+
+# =====================================================
+# 3. Оставляем ISIN, присутствующие в fin_inv
+# =====================================================
+
+bonds_isin = bonds_prices.columns.intersection(fair_values.index)
+stocks_isin = stocks_prices.columns.intersection(fair_values.index)
+
+bonds_prices = bonds_prices[bonds_isin]
+stocks_prices = stocks_prices[stocks_isin]
+
+print("Облигаций в расчёте:", len(bonds_isin))
+print("Акций в расчёте:", len(stocks_isin))
+
+
+# =====================================================
+# 4. Создаём общую шкалу дат
+# =====================================================
+
+all_dates = bonds_prices.index.union(stocks_prices.index)
+
+all_dates = all_dates.sort_values()
+
+bonds_prices = bonds_prices.reindex(all_dates)
+stocks_prices = stocks_prices.reindex(all_dates)
+
+# Пропущенные котировки заполняем последней
+# известной ценой, но не будущей ценой
+bonds_prices = bonds_prices.ffill()
+stocks_prices = stocks_prices.ffill()
+
+
+# =====================================================
+# 5. Доходности по каждому ISIN
+# =====================================================
+
+returns_bonds = bonds_prices.pct_change(fill_method=None)
+returns_stocks = stocks_prices.pct_change(fill_method=None)
+
+
+# =====================================================
+# 6. Умножаем доходности на fair_value
+# =====================================================
+
+weighted_bonds = returns_bonds.mul(
+    fair_values.reindex(bonds_isin),
+    axis=1
+)
+
+weighted_stocks = returns_stocks.mul(
+    fair_values.reindex(stocks_isin),
+    axis=1
+)
+
+
+# =====================================================
+# 7. Суммарный PnL на каждую дату
+# =====================================================
+
+bonds_daily = weighted_bonds.sum(axis=1, min_count=1)
+stocks_daily = weighted_stocks.sum(axis=1, min_count=1)
+
+
+# =====================================================
+# 8. Общий датафрейм
+# =====================================================
+
+daily_returns = pd.DataFrame({
+    "stocks": stocks_daily,
+    "bonds": bonds_daily
+})
+
+# Если на дату нет рассчитанного PnL по классу,
+# временно принимаем его вклад равным нулю
+daily_returns = daily_returns.fillna(0)
+
+daily_returns["total"] = (
+    daily_returns["stocks"] +
+    daily_returns["bonds"]
+)
+
+# Первая дата не имеет предыдущей цены
+daily_returns = daily_returns.iloc[1:].copy()
+
+daily_returns.index.name = "Дата"
+
+
+# =====================================================
+# 9. Отдельный датафрейм total
+# =====================================================
+
+total = daily_returns[["total"]].copy()
+
+
+# =====================================================
+# 10. Исторический VaR 95%
+# =====================================================
+
+confidence_level = 0.95
+alpha = 1 - confidence_level
+
+var_95 = pd.DataFrame({
+    "VaR_95": [
+        max(0, -daily_returns["stocks"].quantile(alpha)),
+        max(0, -daily_returns["bonds"].quantile(alpha)),
+        max(0, -daily_returns["total"].quantile(alpha))
+    ]
+}, index=["stocks", "bonds", "total"])
+
+var_95.index.name = "Portfolio"
+
+
+# =====================================================
+# 11. Результаты
+# =====================================================
+
+print("\nДневной PnL портфелей:")
+print(daily_returns.tail())
+
+print("\nVaR 95%:")
+print(var_95)
