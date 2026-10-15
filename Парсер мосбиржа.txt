@@ -1,0 +1,455 @@
+
+import os
+import json
+import tempfile
+import subprocess
+import urllib.request
+import pandas as pd
+
+from pathlib import Path
+from urllib.parse import urlencode, quote
+
+
+# =====================================================
+# 1. ПАРАМЕТРЫ
+# =====================================================
+
+report_date = "2026-10-13"
+
+report_date = pd.to_datetime(
+    report_date, format="%Y-%m-%d"
+).strftime("%Y-%m-%d")
+
+# Корпоративный прокси
+proxy_url = urllib.request.getproxies().get("https")
+
+if not proxy_url:
+    raise RuntimeError("HTTPS-прокси не найден")
+
+
+# =====================================================
+# 2. POWERSHELL: АВТОРИЗАЦИЯ WINDOWS
+# =====================================================
+
+ps_script = r"""
+$ErrorActionPreference = "Stop";
+
+$proxy = [System.Net.WebProxy]::new($env:MOEX_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+
+try {
+    $client.DownloadFile(
+        $env:MOEX_URL,
+        $env:MOEX_OUTPUT
+    );
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+# =====================================================
+# 3. ЗАГРУЗКА JSON ЧЕРЕЗ ПРОКСИ
+# =====================================================
+
+def download_moex_json(url):
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        output_file = Path(temp_dir) / "moex.json"
+
+        env = os.environ.copy()
+        env["MOEX_PROXY"] = proxy_url
+        env["MOEX_URL"] = url
+        env["MOEX_OUTPUT"] = str(output_file)
+
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile",
+             "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=90
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+
+        if not output_file.exists():
+            raise FileNotFoundError("JSON не загружен")
+
+        with open(output_file, encoding="utf-8-sig") as f:
+            return json.load(f)
+
+
+# =====================================================
+# 4. ПРЕОБРАЗОВАНИЕ БЛОКА MOEX В DATAFRAME
+# =====================================================
+
+def moex_to_df(data, block):
+
+    section = data.get(block, {})
+
+    columns = section.get("columns", [])
+    rows = section.get("data", [])
+
+    df = pd.DataFrame(rows, columns=columns)
+    df.columns = df.columns.str.lower()
+
+    return df
+
+
+# =====================================================
+# 5. ПОИСК SECID ПО ISIN
+# =====================================================
+
+def isin_to_secid(isin, market):
+
+    url = (
+        "https://iss.moex.com/iss/securities.json?"
+        + urlencode({
+            "q": isin,
+            "iss.meta": "off"
+        })
+    )
+
+    data = download_moex_json(url)
+    df = moex_to_df(data, "securities")
+
+    if df.empty:
+        return None
+
+    # Проверяем точное совпадение ISIN
+    if "isin" in df.columns:
+        isin_match = (
+            df["isin"].astype(str).str.upper() == isin
+        )
+    else:
+        isin_match = pd.Series(False, index=df.index)
+
+    secid_match = (
+        df["secid"].astype(str).str.upper() == isin
+    )
+
+    df = df[isin_match | secid_match].copy()
+
+    if df.empty:
+        return None
+
+    # Если найдено несколько инструментов,
+    # выбираем соответствующий рынок
+    if "group" in df.columns:
+        expected_group = "stock_" + market
+
+        suitable = df[
+            df["group"].astype(str) == expected_group
+        ]
+
+        if not suitable.empty:
+            df = suitable
+
+    return str(df.iloc[0]["secid"])
+
+
+# =====================================================
+# 6. ОПРЕДЕЛЕНИЕ ТИПА БУМАГИ
+# =====================================================
+
+def get_market_board(security_type, issuer):
+
+    security_type = str(security_type).strip().lower()
+    issuer = str(issuer).strip().upper()
+
+    if "акци" in security_type:
+        return "shares", "TQBR"
+
+    if "облигац" in security_type:
+
+        if "МИНФИН РОССИИ" in issuer:
+            return "bonds", "TQOB"
+
+        return "bonds", "TQCB"
+
+    raise ValueError(
+        f"Неизвестный тип бумаги: {security_type}"
+    )
+
+
+# =====================================================
+# 7. ПОЛУЧЕНИЕ ДОПОЛНИТЕЛЬНЫХ РЕЖИМОВ ТОРГОВ
+# =====================================================
+
+def get_other_boards(secid, market, main_board):
+
+    url = (
+        "https://iss.moex.com/iss/securities/"
+        f"{quote(secid, safe='')}.json?"
+        + urlencode({
+            "iss.meta": "off",
+            "iss.only": "boards"
+        })
+    )
+
+    data = download_moex_json(url)
+    df = moex_to_df(data, "boards")
+
+    if df.empty:
+        return []
+
+    df = df[
+        (df["engine"] == "stock") &
+        (df["market"] == market)
+    ].copy()
+
+    if df.empty:
+        return []
+
+    if "is_primary" in df.columns:
+        df["is_primary"] = pd.to_numeric(
+            df["is_primary"], errors="coerce"
+        ).fillna(0)
+
+        df = df.sort_values(
+            "is_primary", ascending=False
+        )
+
+    boards = df["boardid"].dropna().tolist()
+
+    return [
+        board for board in dict.fromkeys(boards)
+        if board != main_board
+    ]
+
+
+# =====================================================
+# 8. ЗАГРУЗКА CLOSE ПО SECID, BOARD И ДАТЕ
+# =====================================================
+
+def get_close_by_board(secid, market, board, date):
+
+    params = {
+        "from": date,
+        "till": date,
+        "iss.meta": "off",
+        "iss.only": "history",
+        "history.columns": "TRADEDATE,CLOSE"
+    }
+
+    url = (
+        "https://iss.moex.com/iss/history/"
+        "engines/stock/"
+        f"markets/{market}/"
+        f"boards/{board}/"
+        f"securities/{quote(secid, safe='')}.json?"
+        + urlencode(params)
+    )
+
+    data = download_moex_json(url)
+    df = moex_to_df(data, "history")
+
+    if df.empty:
+        return None
+
+    if not {"tradedate", "close"}.issubset(df.columns):
+        return None
+
+    # Строго проверяем дату
+    df = df[
+        df["tradedate"].astype(str) == date
+    ]
+
+    if df.empty:
+        return None
+
+    prices = pd.to_numeric(
+        df["close"], errors="coerce"
+    )
+
+    prices = prices[
+        prices.notna() &
+        (prices > 0)
+    ]
+
+    if prices.empty:
+        return None
+
+    return float(prices.iloc[-1])
+
+
+# =====================================================
+# 9. ПОИСК CLOSE С ПРОВЕРКОЙ РЕЖИМОВ
+# =====================================================
+
+def get_security_close(isin, security_type, issuer, date):
+
+    market, main_board = get_market_board(
+        security_type, issuer
+    )
+
+    # ISIN -> SECID
+    secid = isin_to_secid(isin, market)
+
+    if secid is None:
+        return float("nan"), "ISIN не найден"
+
+    # Сначала основной режим торгов
+    close = get_close_by_board(
+        secid, market, main_board, date
+    )
+
+    if close is not None:
+        return close, f"OK ({main_board})"
+
+    # Если котировки нет, проверяем другие режимы
+    boards = get_other_boards(
+        secid, market, main_board
+    )
+
+    for board in boards:
+
+        close = get_close_by_board(
+            secid, market, board, date
+        )
+
+        if close is not None:
+            return close, f"OK ({board})"
+
+    return float("nan"), "Нет котировки"
+
+
+# =====================================================
+# 10. ОБРАБОТКА FIN_INV
+# =====================================================
+
+def parse_fin_inv(fin_inv, report_date):
+
+    required_columns = [
+        "ISIN",
+        "Тип ФВ",
+        "Наименование эмитента"
+    ]
+
+    missing = [
+        col for col in required_columns
+        if col not in fin_inv.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Отсутствуют колонки: {missing}"
+        )
+
+    securities = fin_inv[required_columns].copy()
+
+    securities["ISIN"] = (
+        securities["ISIN"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+    # Одна котировка для каждого уникального ISIN
+    securities = securities.drop_duplicates(
+        subset=["ISIN"]
+    )
+
+    results = []
+    diagnostics = []
+
+    total = len(securities)
+
+    for i, (_, row) in enumerate(
+        securities.iterrows(), start=1
+    ):
+
+        isin = row["ISIN"]
+        security_type = row["Тип ФВ"]
+        issuer = row["Наименование эмитента"]
+
+        print(f"[{i}/{total}] {isin}")
+
+        try:
+
+            if pd.isna(isin) or not isin:
+                raise ValueError("Пустой ISIN")
+
+            close, status = get_security_close(
+                isin,
+                security_type,
+                issuer,
+                report_date
+            )
+
+        except Exception as e:
+
+            close = float("nan")
+            status = f"Ошибка: {e}"
+
+        results.append({
+            "ISIN": isin,
+            "Наименование эмитента": issuer,
+            "close": close
+        })
+
+        diagnostics.append({
+            "ISIN": isin,
+            "status": status
+        })
+
+        print(f"    close={close} | {status}")
+
+    result_df = pd.DataFrame(
+        results,
+        columns=[
+            "ISIN",
+            "Наименование эмитента",
+            "close"
+        ]
+    )
+
+    status_df = pd.DataFrame(diagnostics)
+
+    return result_df, status_df
+
+
+# =====================================================
+# 11. ЗАПУСК
+# =====================================================
+
+result_df, status_df = parse_fin_inv(
+    fin_inv,
+    report_date
+)
+
+print("\nИтоговые котировки:")
+print(result_df)
+
+print("\nНе найденные котировки:")
+print(
+    status_df[
+        ~status_df["status"].str.startswith("OK")
+    ]
+)
+
+# =====================================================
+# 12. СОХРАНЕНИЕ В EXCEL
+# =====================================================
+
+with pd.ExcelWriter("MOEX_close.xlsx") as writer:
+
+    result_df.to_excel(
+        writer,
+        sheet_name="Close",
+        index=False
+    )
+
+    status_df.to_excel(
+        writer,
+        sheet_name="Status",
+        index=False
+    )
