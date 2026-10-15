@@ -918,7 +918,65 @@ result_df, status_df, moex_df = parse_fin_inv(
     fin_inv,
     report_date
 )
+# =====================================================
+# 16.1. ЗАПОЛНЕНИЕ ПРОПУСКОВ ИЗ MOEX_ALL
+# =====================================================
 
+# Если общая таблица называется moex_df
+moex_all = moex_df
+
+# Соответствие ISIN -> SECID
+isin_map = status_df[
+    ["ISIN", "SECID", "BOARDID"]
+].drop_duplicates(subset="ISIN")
+
+# Котировки из MOEX
+moex_prices = moex_all[
+    ["SECID", "BOARDID", "close"]
+].copy()
+
+moex_prices = moex_prices.rename(
+    columns={"close": "moex_close"}
+)
+
+# Добавляем ISIN к котировкам
+moex_prices = isin_map.merge(
+    moex_prices,
+    on=["SECID", "BOARDID"],
+    how="left",
+    validate="many_to_one"
+)
+
+# Присоединяем цены к result_df
+result_df = result_df.merge(
+    moex_prices[["ISIN", "moex_close"]],
+    on="ISIN",
+    how="left",
+    validate="many_to_one"
+)
+
+# Заполняем только отсутствующие значения
+mask = (
+    result_df["close"].isna()
+    & result_df["moex_close"].notna()
+)
+
+filled_isins = result_df.loc[mask, "ISIN"]
+
+result_df.loc[mask, "close"] = (
+    result_df.loc[mask, "moex_close"]
+)
+
+# Обновляем статусы
+status_df.loc[
+    status_df["ISIN"].isin(filled_isins),
+    "status"
+] = "OK (из MOEX)"
+
+# Удаляем вспомогательную колонку
+result_df = result_df.drop(columns=["moex_close"])
+
+print("Заполнено котировок:", mask.sum())
 
 # =====================================================
 # 17. СТАТИСТИКА
