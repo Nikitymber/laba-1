@@ -1,29 +1,470 @@
 
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlencode, quote
-import pandas as pd
+import os
+import json
+import base64
+import subprocess
+import urllib.request
+
 import numpy as np
+import pandas as pd
+
+from urllib.parse import urlencode, quote
+from concurrent.futures import ThreadPoolExecutor
 
 
 # =====================================================
-# 1. НАСТРОЙКИ ПОИСКА ПРЕДЫДУЩЕЙ КОТИРОВКИ
+# 1. НАСТРОЙКИ
 # =====================================================
 
-# Максимальная глубина поиска — 10 лет
+report_date = "2026-10-13"
+
+BOARDS = {
+    "TQBR": "shares",
+    "TQOB": "bonds",
+    "TQCB": "bonds"
+}
+
+MAX_WORKERS = 4
+
+# Максимальная глубина поиска предыдущей цены
 MAX_LOOKBACK_DAYS = 3650
 
-# Количество параллельных запросов
-FALLBACK_WORKERS = 4
+# Интервалы поиска от ближайших дат к старым
+SEARCH_WINDOWS = [30, 90, 365, 730, 1095, 3650]
 
-# Интервалы поиска от новых дат к старым
-SEARCH_WINDOWS = [30, 60, 275, 730, 2555]
+report_date = pd.Timestamp(
+    report_date
+).strftime("%Y-%m-%d")
 
 
 # =====================================================
-# 2. ЗАГРУЗКА ИСТОРИИ ОДНОЙ БУМАГИ ЗА ПЕРИОД
+# 2. КОРПОРАТИВНЫЙ ПРОКСИ
 # =====================================================
 
-def get_history_period(secid, board, date_from, date_to):
+proxy_url = urllib.request.getproxies().get("https")
+
+if not proxy_url:
+    raise RuntimeError("Корпоративный HTTPS-прокси не найден")
+
+
+ps_script = r"""
+$ErrorActionPreference = "Stop";
+
+$proxy = [System.Net.WebProxy]::new($env:MOEX_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+
+try {
+    $bytes = $client.DownloadData($env:MOEX_URL);
+
+    [Console]::Out.Write(
+        [Convert]::ToBase64String($bytes)
+    );
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+# =====================================================
+# 3. ЗАГРУЗКА JSON ЧЕРЕЗ ПРОКСИ БЕЗ ФАЙЛОВ
+# =====================================================
+
+def download_moex_json(url):
+
+    env = os.environ.copy()
+
+    env["MOEX_PROXY"] = proxy_url
+    env["MOEX_URL"] = url
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            ps_script
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=env,
+        timeout=90
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Ошибка подключения MOEX: {result.stderr}"
+        )
+
+    if not result.stdout.strip():
+        raise ValueError("MOEX вернула пустой ответ")
+
+    raw = base64.b64decode(
+        result.stdout.strip(),
+        validate=True
+    )
+
+    return json.loads(raw.decode("utf-8-sig"))
+
+
+# =====================================================
+# 4. ПРЕОБРАЗОВАНИЕ ОТВЕТА MOEX
+# =====================================================
+
+def moex_table(data, block):
+
+    section = data.get(block, {})
+
+    return pd.DataFrame(
+        section.get("data", []),
+        columns=section.get("columns", [])
+    )
+
+
+# =====================================================
+# 5. УНИВЕРСАЛЬНАЯ ПОСТРАНИЧНАЯ ЗАГРУЗКА
+# =====================================================
+
+def load_history_pages(url, params):
+
+    start = 0
+
+    for page in range(1000):
+
+        request_params = {
+            **params,
+            "start": start,
+            "iss.meta": "off",
+            "iss.only": "history,history.cursor"
+        }
+
+        data = download_moex_json(
+            url + "?" + urlencode(request_params)
+        )
+
+        if "history" not in data:
+            raise ValueError(
+                "В ответе MOEX отсутствует блок history"
+            )
+
+        df = moex_table(data, "history")
+
+        if df.empty:
+            break
+
+        yield df
+
+        start += len(df)
+
+        cursor = moex_table(
+            data, "history.cursor"
+        )
+
+        if not cursor.empty and "TOTAL" in cursor.columns:
+
+            total = int(cursor.iloc[0]["TOTAL"])
+
+            if start >= total:
+                break
+
+    else:
+        raise RuntimeError(
+            "Превышен лимит страниц MOEX"
+        )
+
+
+# =====================================================
+# 6. ПАКЕТНАЯ ЗАГРУЗКА КОТИРОВОК НА ДАТУ
+# =====================================================
+
+def download_board_history(board, market, date):
+
+    url = (
+        "https://iss.moex.com/iss/history/"
+        "engines/stock/"
+        f"markets/{market}/"
+        f"boards/{board}/securities.json"
+    )
+
+    columns = [
+        "TRADEDATE",
+        "SECID",
+        "BOARDID",
+        "LEGALCLOSEPRICE"
+    ]
+
+    params = {
+        "date": date,
+        "history.columns": ",".join(columns)
+    }
+
+    parts = []
+
+    for page, df in enumerate(
+        load_history_pages(url, params)
+    ):
+
+        if not set(columns).issubset(df.columns):
+            raise ValueError(
+                f"{board}: отсутствуют необходимые поля. "
+                f"Получены: {df.columns.tolist()}"
+            )
+
+        df["TRADEDATE"] = pd.to_datetime(
+            df["TRADEDATE"],
+            errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+
+        # Проверяем даты в ответе
+        actual_dates = df["TRADEDATE"].dropna().unique()
+
+        wrong_dates = [
+            d for d in actual_dates if d != date
+        ]
+
+        if wrong_dates:
+
+            print(
+                f"{board}: получены записи "
+                f"за другие даты: {wrong_dates[:5]}"
+            )
+
+            # Если API не применил фильтр даты,
+            # не загружаем всю историю биржи.
+            # Отсутствующие цены будут найдены
+            # отдельными запросами по инструментам.
+            if page == 0 and date not in actual_dates:
+                print(
+                    f"{board}: пакетный ответ не содержит "
+                    f"{date}; используем резервный поиск"
+                )
+                break
+
+        # Берём строго нужную дату
+        filtered = df[
+            df["TRADEDATE"] == date
+        ].copy()
+
+        if not filtered.empty:
+            parts.append(filtered[columns])
+
+    if not parts:
+
+        print(f"{board}: котировки на {date} не найдены")
+
+        return pd.DataFrame(columns=columns)
+
+    result = pd.concat(
+        parts, ignore_index=True
+    )
+
+    print(
+        f"{board}: загружено {len(result)} записей"
+    )
+
+    return result
+
+
+# =====================================================
+# 7. ЗАГРУЗКА ОБЩЕЙ ТАБЛИЦЫ
+# =====================================================
+
+def download_all_moex(date):
+
+    print(f"\nЗагрузка MOEX на {date}")
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+
+        futures = {
+            board: executor.submit(
+                download_board_history,
+                board,
+                market,
+                date
+            )
+            for board, market in BOARDS.items()
+        }
+
+        frames = [
+            future.result()
+            for future in futures.values()
+        ]
+
+    moex_df = pd.concat(
+        frames, ignore_index=True
+    )
+
+    moex_df["SECID"] = (
+        moex_df["SECID"]
+        .astype("string")
+        .str.upper()
+        .str.strip()
+    )
+
+    moex_df["BOARDID"] = (
+        moex_df["BOARDID"]
+        .astype("string")
+        .str.upper()
+        .str.strip()
+    )
+
+    moex_df["LEGALCLOSEPRICE"] = pd.to_numeric(
+        moex_df["LEGALCLOSEPRICE"],
+        errors="coerce"
+    )
+
+    moex_df.loc[
+        moex_df["LEGALCLOSEPRICE"] <= 0,
+        "LEGALCLOSEPRICE"
+    ] = np.nan
+
+    # Не допускаем неоднозначного объединения
+    if moex_df.duplicated(
+        ["SECID", "BOARDID"]
+    ).any():
+
+        raise ValueError(
+            "Обнаружены дубликаты SECID + BOARDID"
+        )
+
+    moex_df = moex_df.rename(
+        columns={"LEGALCLOSEPRICE": "close"}
+    )
+
+    print(
+        f"\nВсего котировок MOEX: {len(moex_df)}"
+    )
+
+    return moex_df
+
+
+# =====================================================
+# 8. ОПРЕДЕЛЕНИЕ РЕЖИМА ТОРГОВ
+# =====================================================
+
+def assign_board(security_type, issuer):
+
+    security_type = str(security_type).lower()
+    issuer = str(issuer).upper()
+
+    if "акци" in security_type:
+        return "TQBR"
+
+    if "облигац" in security_type:
+
+        if "МИНФИН РОССИИ" in issuer:
+            return "TQOB"
+
+        return "TQCB"
+
+    return None
+
+
+# =====================================================
+# 9. ПОИСК SECID ПО ISIN
+# =====================================================
+
+def find_secid(isin, board, available_pairs):
+
+    url = (
+        "https://iss.moex.com/iss/securities.json?"
+        + urlencode({
+            "q": isin,
+            "iss.meta": "off",
+            "iss.only": "securities"
+        })
+    )
+
+    data = download_moex_json(url)
+
+    df = moex_table(data, "securities")
+
+    if df.empty:
+        return None
+
+    df.columns = df.columns.str.upper()
+
+    if "SECID" not in df.columns:
+        return None
+
+    isin_mask = pd.Series(
+        False, index=df.index
+    )
+
+    if "ISIN" in df.columns:
+
+        isin_mask = (
+            df["ISIN"]
+            .astype(str)
+            .str.upper() == isin
+        )
+
+    secid_mask = (
+        df["SECID"]
+        .astype(str)
+        .str.upper() == isin
+    )
+
+    df = df[isin_mask | secid_mask].copy()
+
+    if df.empty:
+        return None
+
+    # Предпочитаем нужный основной режим
+    if "PRIMARY_BOARDID" in df.columns:
+
+        preferred = df[
+            df["PRIMARY_BOARDID"]
+            .astype(str)
+            .str.upper() == board
+        ]
+
+        if not preferred.empty:
+            df = preferred
+
+    secids = (
+        df["SECID"]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .unique()
+        .tolist()
+    )
+
+    # Предпочитаем SECID из котировок на дату
+    available = [
+        s for s in secids
+        if (s, board) in available_pairs
+    ]
+
+    if len(available) == 1:
+        return available[0]
+
+    if len(available) > 1:
+        raise ValueError(
+            f"Несколько SECID для {isin}: {available}"
+        )
+
+    if len(secids) == 1:
+        return secids[0]
+
+    if len(secids) > 1:
+        raise ValueError(
+            f"Неоднозначный ISIN {isin}: {secids}"
+        )
+
+    return None
+
+
+# =====================================================
+# 10. ПОИСК ПОСЛЕДНЕЙ ИЗВЕСТНОЙ ЦЕНЫ
+# =====================================================
+
+def get_last_known_close(secid, board, report_date):
 
     market = BOARDS[board]
 
@@ -35,195 +476,334 @@ def get_history_period(secid, board, date_from, date_to):
         f"securities/{quote(str(secid), safe='')}.json"
     )
 
-    start = 0
-    parts = []
+    target = pd.Timestamp(report_date).normalize()
 
-    for _ in range(1000):
+    # Включаем отчётную дату
+    end_date = target
+
+    earliest = target - pd.Timedelta(
+        days=MAX_LOOKBACK_DAYS
+    )
+
+    for window in SEARCH_WINDOWS:
+
+        start_date = max(
+            earliest,
+            end_date - pd.Timedelta(days=window - 1)
+        )
 
         params = {
-            "from": date_from,
-            "till": date_to,
-            "start": start,
-            "iss.meta": "off",
-            "iss.only": "history,history.cursor",
+            "from": start_date.strftime("%Y-%m-%d"),
+            "till": end_date.strftime("%Y-%m-%d"),
             "history.columns": (
                 "TRADEDATE,LEGALCLOSEPRICE"
             )
         }
 
-        data = download_moex_json(
-            url + "?" + urlencode(params)
-        )
+        parts = []
 
-        if "history" not in data:
-            raise ValueError("Отсутствует блок history")
+        for df in load_history_pages(url, params):
 
-        df = moex_table(data, "history")
+            required = {
+                "TRADEDATE",
+                "LEGALCLOSEPRICE"
+            }
 
-        if df.empty:
-            break
+            if not required.issubset(df.columns):
+                raise ValueError(
+                    f"{secid}: отсутствуют поля истории"
+                )
 
-        if not {
-            "TRADEDATE", "LEGALCLOSEPRICE"
-        }.issubset(df.columns):
-            raise ValueError(
-                "Отсутствуют необходимые поля истории"
+            parts.append(df)
+
+        if parts:
+
+            history_df = pd.concat(
+                parts, ignore_index=True
             )
 
-        parts.append(df)
-        start += len(df)
-
-        cursor = moex_table(data, "history.cursor")
-
-        if not cursor.empty and "TOTAL" in cursor.columns:
-
-            total = int(cursor.iloc[0]["TOTAL"])
-
-            if start >= total:
-                break
-
-    else:
-        raise RuntimeError("Превышен лимит страниц MOEX")
-
-    if not parts:
-        return pd.DataFrame(
-            columns=["TRADEDATE", "LEGALCLOSEPRICE"]
-        )
-
-    return pd.concat(parts, ignore_index=True)
-
-
-# =====================================================
-# 3. ПОИСК ПОСЛЕДНЕЙ ИЗВЕСТНОЙ ЦЕНЫ
-# =====================================================
-
-def get_last_known_close(secid, board, report_date):
-
-    target_date = pd.Timestamp(report_date).normalize()
-
-    # Ищем строго раньше отчётной даты
-    end_date = target_date - pd.Timedelta(days=1)
-
-    remaining_days = MAX_LOOKBACK_DAYS
-
-    for window in SEARCH_WINDOWS:
-
-        if remaining_days <= 0:
-            break
-
-        days = min(window, remaining_days)
-
-        start_date = (
-            end_date - pd.Timedelta(days=days - 1)
-        )
-
-        df = get_history_period(
-            secid,
-            board,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d")
-        )
-
-        if not df.empty:
-
-            df["TRADEDATE"] = pd.to_datetime(
-                df["TRADEDATE"],
+            history_df["TRADEDATE"] = pd.to_datetime(
+                history_df["TRADEDATE"],
                 errors="coerce"
             )
 
-            df["LEGALCLOSEPRICE"] = pd.to_numeric(
-                df["LEGALCLOSEPRICE"],
+            history_df["LEGALCLOSEPRICE"] = pd.to_numeric(
+                history_df["LEGALCLOSEPRICE"],
                 errors="coerce"
             )
 
-            # Только корректные прошлые цены
-            df = df[
-                df["TRADEDATE"].between(
+            # Только действительные цены в прошлом
+            history_df = history_df[
+                history_df["TRADEDATE"].between(
                     start_date, end_date
                 )
-                & df["LEGALCLOSEPRICE"].notna()
-                & (df["LEGALCLOSEPRICE"] > 0)
+                & history_df["LEGALCLOSEPRICE"].notna()
+                & (history_df["LEGALCLOSEPRICE"] > 0)
             ]
 
-            if not df.empty:
+            if not history_df.empty:
 
-                df = df.sort_values(
+                last = history_df.sort_values(
                     "TRADEDATE",
                     ascending=False
-                )
-
-                last = df.iloc[0]
+                ).iloc[0]
 
                 return (
                     float(last["LEGALCLOSEPRICE"]),
                     last["TRADEDATE"]
                 )
 
-        remaining_days -= days
+        # Переходим к более раннему интервалу
+        if start_date <= earliest:
+            break
 
-        # Следующий интервал — более ранние даты
-        end_date = start_date - pd.Timedelta(days=1)
+        end_date = (
+            start_date - pd.Timedelta(days=1)
+        )
 
     return np.nan, pd.NaT
 
 
 # =====================================================
-# 4. ЗАПОЛНЕНИЕ ОТСУТСТВУЮЩИХ КОТИРОВОК
+# 11. ПОДГОТОВКА ПОРТФЕЛЯ
 # =====================================================
 
-def fill_missing_closes(
-    result_df,
-    status_df,
-    report_date
-):
+def prepare_portfolio(fin_inv):
 
-    result_df = result_df.copy()
-    status_df = status_df.copy()
+    required = [
+        "ISIN",
+        "Тип ФВ",
+        "Наименование эмитента"
+    ]
 
-    target_date = pd.Timestamp(report_date).normalize()
+    portfolio = fin_inv.copy()
 
-    # Фактическая дата котировки
-    status_df["price_date"] = pd.NaT
+    portfolio.columns = (
+        portfolio.columns.astype(str).str.strip()
+    )
 
-    # Возраст котировки в календарных днях
-    status_df["lag_days"] = pd.Series(
+    missing = [
+        col for col in required
+        if col not in portfolio.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Отсутствуют колонки: {missing}"
+        )
+
+    portfolio = portfolio[required].copy()
+
+    portfolio["ISIN"] = (
+        portfolio["ISIN"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+    )
+
+    portfolio = portfolio.drop_duplicates(
+        subset="ISIN"
+    ).reset_index(drop=True)
+
+    portfolio["BOARDID"] = portfolio.apply(
+        lambda row: assign_board(
+            row["Тип ФВ"],
+            row["Наименование эмитента"]
+        ),
+        axis=1
+    )
+
+    return portfolio
+
+
+# =====================================================
+# 12. СОПОСТАВЛЕНИЕ ISIN -> SECID
+# =====================================================
+
+def prepare_isin_map(portfolio, moex_df):
+
+    available_pairs = set(
+        zip(
+            moex_df["SECID"],
+            moex_df["BOARDID"]
+        )
+    )
+
+    mapping = {}
+    errors = {}
+    tasks = []
+
+    for _, row in portfolio.iterrows():
+
+        isin = row["ISIN"]
+        board = row["BOARDID"]
+
+        if pd.isna(isin) or pd.isna(board):
+            continue
+
+        key = (isin, board)
+
+        # Для облигаций SECID часто равен ISIN
+        if (
+            board in ("TQOB", "TQCB")
+            and key in available_pairs
+        ):
+            mapping[key] = isin
+
+        else:
+            tasks.append(key)
+
+    tasks = list(dict.fromkeys(tasks))
+
+    print(
+        f"\nПоиск SECID: {len(tasks)} бумаг"
+    )
+
+    def resolve(task):
+
+        isin, board = task
+
+        try:
+
+            secid = find_secid(
+                isin,
+                board,
+                available_pairs
+            )
+
+            # Для облигаций дополнительно
+            # допускаем SECID = ISIN
+            if secid is None and board in ("TQOB", "TQCB"):
+                secid = isin
+
+            return task, secid, None
+
+        except Exception as e:
+
+            return task, None, str(e)
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
+        results = list(
+            executor.map(resolve, tasks)
+        )
+
+    for key, secid, error in results:
+
+        if error is not None:
+            errors[key] = error
+
+        elif secid is not None:
+            mapping[key] = secid
+
+    return mapping, errors
+
+
+# =====================================================
+# 13. ОБЪЕДИНЕНИЕ С FIN_INV
+# =====================================================
+
+def merge_with_portfolio(fin_inv, moex_df, report_date):
+
+    portfolio = prepare_portfolio(fin_inv)
+
+    mapping, errors = prepare_isin_map(
+        portfolio, moex_df
+    )
+
+    portfolio["SECID"] = portfolio.apply(
+        lambda row: mapping.get(
+            (row["ISIN"], row["BOARDID"])
+        ),
+        axis=1
+    )
+
+    merged = portfolio.merge(
+        moex_df[
+            ["SECID", "BOARDID", "close"]
+        ],
+        on=["SECID", "BOARDID"],
+        how="left",
+        validate="many_to_one"
+    )
+
+    merged["price_date"] = pd.NaT
+
+    merged["lag_days"] = pd.Series(
         pd.NA,
-        index=status_df.index,
+        index=merged.index,
         dtype="Int64"
     )
 
-    # Для найденных на заданную дату котировок
-    ok_mask = status_df["status"] == "OK"
+    merged["status"] = "Нет котировки"
 
-    status_df.loc[ok_mask, "price_date"] = target_date
-    status_df.loc[ok_mask, "lag_days"] = 0
+    target = pd.Timestamp(report_date)
 
-    # Выбираем бумаги без цены
-    missing_isins = set(
-        result_df.loc[
-            result_df["close"].isna(), "ISIN"
-        ].dropna()
-    )
+    # Найденные цены на отчётную дату
+    ok = merged["close"].notna()
 
-    tasks_df = status_df[
-        status_df["ISIN"].isin(missing_isins)
-        & status_df["SECID"].notna()
-        & status_df["BOARDID"].isin(BOARDS)
-    ].drop_duplicates("ISIN")
+    merged.loc[ok, "price_date"] = target
+    merged.loc[ok, "lag_days"] = 0
+    merged.loc[ok, "status"] = "OK"
 
-    tasks = list(
-        tasks_df[
-            ["ISIN", "SECID", "BOARDID"]
-        ].itertuples(index=False, name=None)
-    )
+    # Статусы для остальных
+    for idx, row in merged.loc[~ok].iterrows():
+
+        key = (row["ISIN"], row["BOARDID"])
+
+        if pd.isna(row["ISIN"]):
+            status = "Пустой ISIN"
+
+        elif pd.isna(row["BOARDID"]):
+            status = "Неизвестный тип бумаги"
+
+        elif key in errors:
+            status = f"Ошибка SECID: {errors[key]}"
+
+        elif pd.isna(row["SECID"]):
+            status = "SECID не найден"
+
+        else:
+            status = "Требуется поиск истории"
+
+        merged.at[idx, "status"] = status
+
+    return merged
+
+
+# =====================================================
+# 14. ЗАПОЛНЕНИЕ ОТСУТСТВУЮЩИХ ЦЕН
+# =====================================================
+
+def fill_missing_closes(merged, report_date):
+
+    merged = merged.copy()
+
+    target = pd.Timestamp(report_date)
+
+    tasks = []
+
+    for idx, row in merged.iterrows():
+
+        if (
+            pd.isna(row["close"])
+            and pd.notna(row["SECID"])
+            and row["BOARDID"] in BOARDS
+        ):
+
+            tasks.append(
+                (idx, row["SECID"], row["BOARDID"])
+            )
 
     print(
-        f"\nБумаги для поиска прошлой цены: {len(tasks)}"
+        f"\nПоиск последних известных цен: {len(tasks)}"
     )
 
-    def process_security(task):
+    def process(task):
 
-        isin, secid, board = task
+        idx, secid, board = task
 
         try:
 
@@ -233,99 +813,119 @@ def fill_missing_closes(
                 report_date
             )
 
-            return isin, price, price_date, None
+            return idx, price, price_date, None
 
         except Exception as e:
 
-            return isin, np.nan, pd.NaT, str(e)
+            return idx, np.nan, pd.NaT, str(e)
 
-    # Параллельный поиск
     with ThreadPoolExecutor(
-        max_workers=FALLBACK_WORKERS
+        max_workers=MAX_WORKERS
     ) as executor:
 
-        fallback_results = list(
-            executor.map(process_security, tasks)
+        results = list(
+            executor.map(process, tasks)
         )
 
-    # Записываем найденные значения
-    for isin, price, price_date, error in fallback_results:
-
-        result_mask = result_df["ISIN"] == isin
-        status_mask = status_df["ISIN"] == isin
+    for idx, price, price_date, error in results:
 
         if pd.notna(price):
 
-            result_df.loc[
-                result_mask, "close"
-            ] = price
+            merged.at[idx, "close"] = price
+            merged.at[idx, "price_date"] = price_date
 
-            status_df.loc[
-                status_mask, "price_date"
-            ] = price_date
+            lag = (target - price_date).days
 
-            lag_days = (
-                target_date - price_date
-            ).days
+            merged.at[idx, "lag_days"] = lag
 
-            status_df.loc[
-                status_mask, "lag_days"
-            ] = lag_days
+            if lag == 0:
+                merged.at[idx, "status"] = (
+                    "OK (индивидуальный запрос)"
+                )
+            else:
+                merged.at[idx, "status"] = (
+                    "OK (последняя известная цена)"
+                )
 
-            status_df.loc[
-                status_mask, "status"
-            ] = "OK (предыдущая дата)"
+        elif error is not None:
 
-            print(
-                f"{isin}: {price} "
-                f"от {price_date:%Y-%m-%d}"
+            merged.at[idx, "status"] = (
+                f"Ошибка поиска истории: {error}"
             )
-
-        elif error:
-
-            status_df.loc[
-                status_mask, "status"
-            ] = f"Ошибка поиска истории: {error}"
 
         else:
 
-            status_df.loc[
-                status_mask, "status"
-            ] = "Историческая цена не найдена"
+            merged.at[idx, "status"] = (
+                "Историческая цена не найдена"
+            )
 
-    return result_df, status_df
+    return merged
 
 
 # =====================================================
-# 5. ЗАПУСК ПОЛНОГО ПАРСЕРА
+# 15. ОСНОВНАЯ ФУНКЦИЯ ПАРСЕРА
 # =====================================================
 
-# Шаг 1. Загружаем котировки на заданную дату
-moex_df = download_all_moex(report_date)
+def parse_fin_inv(fin_inv, report_date):
 
-# Шаг 2. Объединяем с портфелем
-result_df, status_df = merge_with_portfolio(
+    # 1. Пакетная загрузка котировок
+    moex_df = download_all_moex(report_date)
+
+    # 2. Сопоставление с портфелем
+    merged = merge_with_portfolio(
+        fin_inv,
+        moex_df,
+        report_date
+    )
+
+    # 3. Поиск последних известных цен
+    merged = fill_missing_closes(
+        merged,
+        report_date
+    )
+
+    # 4. Итоговый DataFrame
+    result_df = merged[
+        [
+            "ISIN",
+            "Наименование эмитента",
+            "close"
+        ]
+    ].copy()
+
+    # 5. Диагностика
+    status_df = merged[
+        [
+            "ISIN",
+            "SECID",
+            "BOARDID",
+            "price_date",
+            "lag_days",
+            "status"
+        ]
+    ].copy()
+
+    return result_df, status_df, moex_df
+
+
+# =====================================================
+# 16. ЗАПУСК
+# =====================================================
+
+# DataFrame fin_inv должен быть создан заранее
+
+result_df, status_df, moex_df = parse_fin_inv(
     fin_inv,
-    moex_df
-)
-
-# Шаг 3. Заполняем отсутствующие цены
-result_df, status_df = fill_missing_closes(
-    result_df,
-    status_df,
     report_date
 )
 
 
 # =====================================================
-# 6. РЕЗУЛЬТАТЫ
+# 17. СТАТИСТИКА
 # =====================================================
 
 print("\nИТОГОВЫЕ КОТИРОВКИ")
 print(result_df)
-
-print("\nСТАТУСЫ И ДАТЫ КОТИРОВОК")
-print(status_df)
 
 print("\nСТАТИСТИКА")
 
@@ -337,11 +937,43 @@ print(
 )
 
 print(
-    "Взято за предыдущие даты:",
-    (status_df["status"] == "OK (предыдущая дата)").sum()
+    "Последняя известная цена:",
+    (
+        status_df["status"]
+        == "OK (последняя известная цена)"
+    ).sum()
 )
 
 print(
     "Без котировок:",
     result_df["close"].isna().sum()
 )
+
+print("\nБУМАГИ БЕЗ ЦЕНЫ")
+
+print(
+    status_df[
+        status_df["status"].str.startswith("OK") == False
+    ]
+)
+
+
+# =====================================================
+# 18. СОХРАНЕНИЕ В EXCEL (НЕОБЯЗАТЕЛЬНО)
+# =====================================================
+
+# Раскомментировать, если нужна выгрузка
+
+# with pd.ExcelWriter("MOEX_prices.xlsx") as writer:
+#
+#     result_df.to_excel(
+#         writer, sheet_name="Portfolio", index=False
+#     )
+#
+#     status_df.to_excel(
+#         writer, sheet_name="Status", index=False
+#     )
+#
+#     moex_df.to_excel(
+#         writer, sheet_name="All_MOEX", index=False
+#     )
