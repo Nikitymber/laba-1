@@ -1,0 +1,804 @@
+
+import os
+import json
+import tempfile
+import subprocess
+import urllib.request
+
+import numpy as np
+import pandas as pd
+
+from pathlib import Path
+from urllib.parse import urlencode
+from concurrent.futures import ThreadPoolExecutor
+
+
+# =====================================================
+# 1. НАСТРОЙКИ
+# =====================================================
+
+report_date = "2026-10-13"
+
+BOARDS = {
+    "TQBR": "shares",
+    "TQOB": "bonds",
+    "TQCB": "bonds"
+}
+
+MAX_WORKERS = 4
+
+# Кэширование данных
+CACHE_DIR = Path("MOEX_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+ISIN_CACHE = CACHE_DIR / "isin_secid.json"
+
+# True — повторно использовать сохранённые котировки
+USE_PRICE_CACHE = True
+
+report_date = pd.to_datetime(
+    report_date, format="%Y-%m-%d"
+).strftime("%Y-%m-%d")
+
+
+# =====================================================
+# 2. КОРПОРАТИВНЫЙ ПРОКСИ
+# =====================================================
+
+proxy_url = urllib.request.getproxies().get("https")
+
+if not proxy_url:
+    raise RuntimeError(
+        "Корпоративный HTTPS-прокси не найден"
+    )
+
+ps_script = r"""
+$ErrorActionPreference = "Stop";
+
+$proxy = [System.Net.WebProxy]::new($env:MOEX_PROXY);
+
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+
+$client.Proxy = $proxy;
+
+try {
+    $client.DownloadFile(
+        $env:MOEX_URL,
+        $env:MOEX_OUTPUT
+    );
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+# =====================================================
+# 3. ЗАГРУЗКА JSON ЧЕРЕЗ ПРОКСИ
+# =====================================================
+
+def download_moex_json(url):
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        output_file = Path(temp_dir) / "moex.json"
+
+        env = os.environ.copy()
+
+        env["MOEX_PROXY"] = proxy_url
+        env["MOEX_URL"] = url
+        env["MOEX_OUTPUT"] = str(output_file)
+
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                ps_script
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=90
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Ошибка MOEX:\n{result.stderr}"
+            )
+
+        if not output_file.exists():
+            raise FileNotFoundError(
+                "Файл JSON не был загружен"
+            )
+
+        with open(
+            output_file,
+            "r",
+            encoding="utf-8-sig"
+        ) as f:
+
+            return json.load(f)
+
+
+# =====================================================
+# 4. ПРЕОБРАЗОВАНИЕ БЛОКА MOEX В DATAFRAME
+# =====================================================
+
+def moex_table(data, block):
+
+    section = data.get(block, {})
+
+    return pd.DataFrame(
+        section.get("data", []),
+        columns=section.get("columns", [])
+    )
+
+
+# =====================================================
+# 5. ЗАГРУЗКА ВСЕХ ОФИЦИАЛЬНЫХ ЦЕН ЗАКРЫТИЯ
+#    ПО ОДНОМУ РЕЖИМУ ТОРГОВ
+# =====================================================
+
+def download_board_history(board, market, date):
+
+    url = (
+        "https://iss.moex.com/iss/history/"
+        "engines/stock/"
+        f"markets/{market}/"
+        f"boards/{board}/securities.json"
+    )
+
+    start = 0
+    parts = []
+
+    for _ in range(1000):
+
+        params = {
+            "date": date,
+            "start": start,
+            "iss.meta": "off",
+            "iss.only": "history,history.cursor",
+            "history.columns": (
+                "TRADEDATE,SECID,BOARDID,"
+                "LEGALCLOSEPRICE"
+            )
+        }
+
+        data = download_moex_json(
+            url + "?" + urlencode(params)
+        )
+
+        if "history" not in data:
+            raise ValueError(
+                f"{board}: отсутствует блок history"
+            )
+
+        df = moex_table(data, "history")
+
+        if df.empty:
+            break
+
+        required = {
+            "TRADEDATE",
+            "SECID",
+            "LEGALCLOSEPRICE"
+        }
+
+        if not required.issubset(df.columns):
+            raise ValueError(
+                f"{board}: неожиданные поля "
+                f"{df.columns.tolist()}"
+            )
+
+        if "BOARDID" not in df.columns:
+            df["BOARDID"] = board
+
+        parts.append(df)
+
+        start += len(df)
+
+        cursor = moex_table(
+            data, "history.cursor"
+        )
+
+        if not cursor.empty and "TOTAL" in cursor.columns:
+
+            total = int(cursor.iloc[0]["TOTAL"])
+
+            if start >= total:
+                break
+
+    else:
+        raise RuntimeError(
+            f"{board}: превышен лимит страниц"
+        )
+
+    columns = [
+        "TRADEDATE",
+        "SECID",
+        "BOARDID",
+        "LEGALCLOSEPRICE"
+    ]
+
+    if not parts:
+        print(f"{board}: данные отсутствуют")
+        return pd.DataFrame(columns=columns)
+
+    result = pd.concat(
+        parts,
+        ignore_index=True
+    )
+
+    # Проверяем дату
+    result = result[
+        result["TRADEDATE"].astype(str) == date
+    ].copy()
+
+    print(
+        f"{board}: загружено {len(result)} котировок"
+    )
+
+    return result[columns]
+
+
+# =====================================================
+# 6. ЗАГРУЗКА ОБЩЕЙ ТАБЛИЦЫ MOEX
+# =====================================================
+
+def download_all_moex(date):
+
+    cache_file = (
+        CACHE_DIR / f"MOEX_{date}.csv"
+    )
+
+    if USE_PRICE_CACHE and cache_file.exists():
+
+        print("Загрузка котировок из кэша")
+
+        moex_df = pd.read_csv(
+            cache_file,
+            dtype={
+                "SECID": str,
+                "BOARDID": str,
+                "TRADEDATE": str
+            }
+        )
+
+    else:
+
+        print("Загрузка котировок с MOEX...")
+
+        with ThreadPoolExecutor(
+            max_workers=3
+        ) as executor:
+
+            futures = {
+                board: executor.submit(
+                    download_board_history,
+                    board,
+                    market,
+                    date
+                )
+                for board, market in BOARDS.items()
+            }
+
+            frames = [
+                future.result()
+                for future in futures.values()
+            ]
+
+        moex_df = pd.concat(
+            frames,
+            ignore_index=True
+        )
+
+        # Сохраняем полную таблицу для повторного запуска
+        moex_df.to_csv(
+            cache_file,
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+    # Приведение типов
+    moex_df["SECID"] = (
+        moex_df["SECID"]
+        .astype("string")
+        .str.upper()
+        .str.strip()
+    )
+
+    moex_df["BOARDID"] = (
+        moex_df["BOARDID"]
+        .astype("string")
+        .str.upper()
+        .str.strip()
+    )
+
+    moex_df["LEGALCLOSEPRICE"] = pd.to_numeric(
+        moex_df["LEGALCLOSEPRICE"],
+        errors="coerce"
+    )
+
+    # Нулевые и отрицательные цены недопустимы
+    moex_df.loc[
+        moex_df["LEGALCLOSEPRICE"] <= 0,
+        "LEGALCLOSEPRICE"
+    ] = np.nan
+
+    # Защита от некорректного кэша
+    if not moex_df.empty:
+
+        dates = moex_df["TRADEDATE"].astype(str)
+
+        if not dates.eq(date).all():
+            raise ValueError(
+                "В таблице обнаружены котировки другой даты"
+            )
+
+        duplicates = moex_df.duplicated(
+            subset=["SECID", "BOARDID"]
+        )
+
+        if duplicates.any():
+            raise ValueError(
+                "Найдены дубли SECID + BOARDID"
+            )
+
+    # Итоговая цена закрытия
+    moex_df = moex_df.rename(
+        columns={"LEGALCLOSEPRICE": "close"}
+    )
+
+    print(
+        f"\nВсего строк MOEX: {len(moex_df)}"
+    )
+
+    return moex_df
+
+
+# =====================================================
+# 7. ОПРЕДЕЛЕНИЕ РЕЖИМА ТОРГОВ
+# =====================================================
+
+def assign_board(security_type, issuer):
+
+    security_type = str(security_type).lower()
+    issuer = str(issuer).upper()
+
+    if "акци" in security_type:
+        return "TQBR"
+
+    if "облигац" in security_type:
+
+        if "МИНФИН РОССИИ" in issuer:
+            return "TQOB"
+
+        return "TQCB"
+
+    return None
+
+
+# =====================================================
+# 8. ПОИСК SECID ПО ISIN
+# =====================================================
+
+def find_secid(isin, market, board):
+
+    url = (
+        "https://iss.moex.com/iss/securities.json?"
+        + urlencode({
+            "q": isin,
+            "iss.meta": "off",
+            "iss.only": "securities"
+        })
+    )
+
+    data = download_moex_json(url)
+
+    df = moex_table(data, "securities")
+
+    if df.empty:
+        return None
+
+    df.columns = df.columns.str.upper()
+
+    if "SECID" not in df.columns:
+        return None
+
+    isin_match = pd.Series(
+        False, index=df.index
+    )
+
+    if "ISIN" in df.columns:
+
+        isin_match = (
+            df["ISIN"]
+            .astype(str)
+            .str.upper() == isin
+        )
+
+    secid_match = (
+        df["SECID"]
+        .astype(str)
+        .str.upper() == isin
+    )
+
+    df = df[isin_match | secid_match].copy()
+
+    if df.empty:
+        return None
+
+    # Предпочитаем соответствующий тип бумаги
+    if "GROUP" in df.columns:
+
+        group_pattern = (
+            "share" if market == "shares" else "bond"
+        )
+
+        suitable = df[
+            df["GROUP"]
+            .astype(str)
+            .str.lower()
+            .str.contains(group_pattern)
+        ]
+
+        if not suitable.empty:
+            df = suitable
+
+    # Предпочитаем соответствующий режим торгов
+    if "PRIMARY_BOARDID" in df.columns:
+
+        suitable = df[
+            df["PRIMARY_BOARDID"]
+            .astype(str)
+            .str.upper() == board
+        ]
+
+        if not suitable.empty:
+            df = suitable
+
+    secids = (
+        df["SECID"]
+        .astype(str)
+        .str.upper()
+        .unique()
+    )
+
+    if len(secids) == 1:
+        return secids[0]
+
+    # Не выбираем произвольный инструмент
+    raise ValueError(
+        f"Неоднозначный ISIN {isin}: {list(secids)}"
+    )
+
+
+# =====================================================
+# 9. ПОДГОТОВКА СПРАВОЧНИКА ISIN -> SECID
+# =====================================================
+
+def prepare_isin_map(securities, moex_df):
+
+    if ISIN_CACHE.exists():
+
+        with open(
+            ISIN_CACHE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            cache = json.load(f)
+
+    else:
+        cache = {}
+
+    available = set(
+        zip(
+            moex_df["SECID"],
+            moex_df["BOARDID"]
+        )
+    )
+
+    mapping = {}
+    errors = {}
+    tasks = []
+
+    # Определяем, какие ISIN требуют поиска
+    for _, row in securities.iterrows():
+
+        isin = row["ISIN"]
+        board = row["BOARDID"]
+
+        if pd.isna(isin) or pd.isna(board):
+            continue
+
+        market = BOARDS[board]
+        cache_key = f"{market}:{isin}"
+
+        key = (isin, board)
+
+        # Для облигаций сначала проверяем SECID = ISIN
+        if market == "bonds" and (isin, board) in available:
+
+            mapping[key] = isin
+
+        elif cache_key in cache:
+
+            mapping[key] = cache[cache_key]
+
+        else:
+
+            tasks.append(
+                (isin, market, board, cache_key)
+            )
+
+    tasks = list(dict.fromkeys(tasks))
+
+    print(
+        f"Поиск новых SECID: {len(tasks)}"
+    )
+
+    # Поиск новых соответствий параллельно
+    def resolve_task(task):
+
+        isin, market, board, cache_key = task
+
+        try:
+
+            secid = find_secid(
+                isin, market, board
+            )
+
+            return task, secid, None
+
+        except Exception as e:
+
+            return task, None, str(e)
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
+        resolved = list(
+            executor.map(resolve_task, tasks)
+        )
+
+    for task, secid, error in resolved:
+
+        isin, market, board, cache_key = task
+        key = (isin, board)
+
+        if error is not None:
+            errors[key] = error
+
+        elif secid is not None:
+
+            mapping[key] = secid
+            cache[cache_key] = secid
+
+    # Сохраняем только найденные соответствия
+    with open(
+        ISIN_CACHE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            cache,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    return mapping, errors
+
+
+# =====================================================
+# 10. ОБЪЕДИНЕНИЕ С FIN_INV
+# =====================================================
+
+def merge_with_portfolio(fin_inv, moex_df):
+
+    required = [
+        "ISIN",
+        "Тип ФВ",
+        "Наименование эмитента"
+    ]
+
+    securities = fin_inv.copy()
+
+    securities.columns = (
+        securities.columns.astype(str).str.strip()
+    )
+
+    missing = [
+        col for col in required
+        if col not in securities.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"В fin_inv отсутствуют колонки: {missing}"
+        )
+
+    securities = securities[required].copy()
+
+    securities["ISIN"] = (
+        securities["ISIN"]
+        .astype("string")
+        .str.upper()
+        .str.strip()
+    )
+
+    securities = securities.drop_duplicates(
+        subset=["ISIN"]
+    ).reset_index(drop=True)
+
+    securities["BOARDID"] = securities.apply(
+        lambda row: assign_board(
+            row["Тип ФВ"],
+            row["Наименование эмитента"]
+        ),
+        axis=1
+    )
+
+    # Получаем соответствия ISIN -> SECID
+    mapping, errors = prepare_isin_map(
+        securities,
+        moex_df
+    )
+
+    securities["SECID"] = securities.apply(
+        lambda row: mapping.get(
+            (row["ISIN"], row["BOARDID"])
+        ),
+        axis=1
+    )
+
+    # Merge по SECID и BOARDID
+    merged = securities.merge(
+        moex_df[
+            ["SECID", "BOARDID", "close"]
+        ],
+        on=["SECID", "BOARDID"],
+        how="left",
+        validate="many_to_one"
+    )
+
+    # Диагностика
+    def get_status(row):
+
+        if pd.isna(row["ISIN"]):
+            return "Пустой ISIN"
+
+        if pd.isna(row["BOARDID"]):
+            return "Неизвестный тип бумаги"
+
+        key = (row["ISIN"], row["BOARDID"])
+
+        if key in errors:
+            return "Ошибка поиска SECID: " + errors[key]
+
+        if pd.isna(row["SECID"]):
+            return "SECID не найден"
+
+        if pd.notna(row["close"]):
+            return "OK"
+
+        if (
+            row["SECID"],
+            row["BOARDID"]
+        ) not in price_keys:
+
+            return "Нет записи в режиме торгов"
+
+        return "Нет LEGALCLOSEPRICE"
+
+    price_keys = set(
+        zip(
+            moex_df["SECID"],
+            moex_df["BOARDID"]
+        )
+    )
+
+    merged["status"] = merged.apply(
+        get_status, axis=1
+    )
+
+    # Требуемый итоговый DataFrame
+    result_df = merged[
+        [
+            "ISIN",
+            "Наименование эмитента",
+            "close"
+        ]
+    ].copy()
+
+    # Отдельный DataFrame для проверки ошибок
+    status_df = merged[
+        [
+            "ISIN",
+            "SECID",
+            "BOARDID",
+            "status"
+        ]
+    ].copy()
+
+    return result_df, status_df
+
+
+# =====================================================
+# 11. ЗАПУСК ПАРСЕРА
+# =====================================================
+
+# fin_inv должен быть уже загружен в память
+
+moex_df = download_all_moex(
+    report_date
+)
+
+result_df, status_df = merge_with_portfolio(
+    fin_inv,
+    moex_df
+)
+
+
+# =====================================================
+# 12. ВЫВОД РЕЗУЛЬТАТОВ
+# =====================================================
+
+print("\nИТОГОВЫЕ КОТИРОВКИ")
+print(result_df)
+
+print("\nСТАТИСТИКА")
+
+print(
+    "Всего бумаг:",
+    len(result_df)
+)
+
+print(
+    "Получено цен закрытия:",
+    result_df["close"].notna().sum()
+)
+
+print(
+    "Без цены закрытия:",
+    result_df["close"].isna().sum()
+)
+
+print("\nБУМАГИ БЕЗ КОТИРОВОК")
+
+print(
+    status_df[
+        status_df["status"] != "OK"
+    ]
+)
+
+
+# =====================================================
+# 13. СОХРАНЕНИЕ В EXCEL
+# =====================================================
+
+with pd.ExcelWriter("MOEX_close.xlsx") as writer:
+
+    result_df.to_excel(
+        writer,
+        sheet_name="Portfolio",
+        index=False
+    )
+
+    status_df.to_excel(
+        writer,
+        sheet_name="Status",
+        index=False
+    )
+
+    moex_df.to_excel(
+        writer,
+        sheet_name="All_MOEX",
+        index=False
+    )
