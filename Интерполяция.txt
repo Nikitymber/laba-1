@@ -1,0 +1,46 @@
+from math import isfinite
+
+
+def interp(terms, vals, target_term):
+    """
+    Линейная интерполяция и экстраполяция.
+
+    terms       — сроки в строго возрастающем порядке.
+    vals        — значения, соответствующие срокам.
+    target_term — срок, для которого нужно вычислить значение.
+    """
+    terms = [float(t) for t in terms]
+    vals = [float(v) for v in vals]
+    target_term = float(target_term)
+
+    # Проверка входных данных
+    if len(terms) != len(vals):
+        raise ValueError("Количество сроков и значений должно совпадать.")
+
+    if len(terms) < 2:
+        raise ValueError("Нужно минимум две точки.")
+
+    if not all(isfinite(x) for x in terms + vals + [target_term]):
+        raise ValueError("Данные не должны содержать NaN или бесконечность.")
+
+    if any(terms[i] >= terms[i + 1] for i in range(len(terms) - 1)):
+        raise ValueError("Сроки должны строго возрастать, без повторов.")
+
+    # Экстраполяция влево: первые две точки
+    if target_term <= terms[0]:
+        i = 0
+
+    # Экстраполяция вправо: последние две точки
+    elif target_term >= terms[-1]:
+        i = len(terms) - 2
+
+    # Интерполяция внутри диапазона
+    else:
+        for i in range(len(terms) - 1):
+            if terms[i] <= target_term <= terms[i + 1]:
+                break
+
+    t1, t2 = terms[i], terms[i + 1]
+    v1, v2 = vals[i], vals[i + 1]
+
+    return v1 + (v2 - v1) * (target_term - t1) / (t2 - t1)
