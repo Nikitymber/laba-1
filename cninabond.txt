@@ -1,0 +1,248 @@
+"""ChinaBond Government Bond Yield Curve через корпоративный прокси Windows.
+
+Установка:
+    python -m pip install pandas lxml
+
+Запуск:
+    python chinabond_parser.py --date 2026-10-13 --output chinabond.csv
+    python chinabond_parser.py
+
+Использование:
+    from chinabond_parser import parse_chinabond
+    df = parse_chinabond("2026-10-13")
+
+Возвращается только ChinaBond Government Bond Yield Curve.
+Индекс результата — Date (DatetimeIndex), столбцы — 3M, 6M, 1Y, 3Y, 5Y,
+7Y, 10Y, 30Y. Одна строка на дату. Ставки в процентах, пропуски — NaN.
+Без даты загружается актуальная таблица сайта; дата берётся из её заголовка.
+Для выбранной даты выполняется POST-запрос, как при нажатии Search на сайте.
+Если данных на эту дату нет, возникает ValueError; подмена даты не выполняется.
+Загрузка использует Windows PowerShell, системный HTTPS-прокси и учётные
+данные пользователя Windows. Ответ передаётся через Base64 без файлов.
+"""
+
+import argparse
+import base64
+import binascii
+import os
+import re
+import subprocess
+import urllib.request
+from io import StringIO
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlencode
+
+import pandas as pd
+
+
+BASE_URL = "https://yield.chinabond.com.cn/cbweb-pbc-web/pbc/"
+PAGE_URL = BASE_URL + "more?locale=en_US"
+QUERY_URL = BASE_URL + "queryGjqxInfo"
+GOVERNMENT_CURVE = "ChinaBond Government Bond Yield Curve"
+MATURITIES = ["3M", "6M", "1Y", "3Y", "5Y", "7Y", "10Y", "30Y"]
+
+
+PS_SCRIPT = r"""
+$ErrorActionPreference = "Stop";
+$ProgressPreference = "SilentlyContinue";
+
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.ServicePointManager]::SecurityProtocol -bor
+    [System.Net.SecurityProtocolType]::Tls12
+);
+
+$proxy = [System.Net.WebProxy]::new($env:CHINABOND_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+$client.Headers["User-Agent"] = "Mozilla/5.0";
+$client.Headers["Accept"] = "text/html";
+$client.Headers["Referer"] = $env:CHINABOND_REFERER;
+
+try {
+    if ($env:CHINABOND_METHOD -eq "POST") {
+        $client.Headers["Content-Type"] = "application/x-www-form-urlencoded";
+        $bytes = $client.UploadData($env:CHINABOND_URL, "POST", [byte[]]@());
+    }
+    else {
+        $bytes = $client.DownloadData($env:CHINABOND_URL);
+    }
+    [Console]::Out.Write([Convert]::ToBase64String($bytes));
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message);
+    exit 1;
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+def download_chinabond_html(
+    url: str,
+    method: str = "GET",
+    proxy_url: Optional[str] = None,
+    timeout: float = 90,
+) -> str:
+    """Загрузить HTML через корпоративный прокси с авторизацией Windows."""
+    method = method.upper()
+    if method not in {"GET", "POST"}:
+        raise ValueError("Поддерживаются только GET и POST.")
+    if timeout <= 0:
+        raise ValueError("timeout должен быть больше нуля.")
+
+    if proxy_url is None:
+        proxy_url = urllib.request.getproxies().get("https")
+    if not proxy_url:
+        raise RuntimeError("Корпоративный HTTPS-прокси не найден.")
+
+    env = os.environ.copy()
+    env["CHINABOND_PROXY"] = proxy_url
+    env["CHINABOND_URL"] = url
+    env["CHINABOND_METHOD"] = method
+    env["CHINABOND_REFERER"] = PAGE_URL
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-Command", PS_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "powershell.exe не найден. Загрузка рассчитана на Windows PowerShell."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Превышено время загрузки ChinaBond через прокси ({timeout} с)."
+        ) from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"код завершения {result.returncode}"
+        raise RuntimeError(f"Ошибка подключения ChinaBond через прокси: {detail}")
+
+    encoded = result.stdout.strip()
+    if not encoded:
+        raise ValueError("ChinaBond вернула пустой ответ.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("PowerShell вернул некорректный Base64.") from exc
+
+    if not raw:
+        raise ValueError("ChinaBond вернула пустой HTML.")
+    return raw.decode("utf-8-sig")
+
+
+def _parse_html(html: str, requested_date: Optional[str] = None) -> pd.DataFrame:
+    """Выделить кривую гособлигаций из страницы или ответа queryGjqxInfo."""
+    try:
+        tables = pd.read_html(
+            StringIO(html),
+            flavor="lxml",
+            na_values=["N/A", "n/a", "—", "-", "--"],
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Таблица ChinaBond не найдена. Проверьте ответ сайта или прокси."
+        ) from exc
+
+    for table in tables:
+        table.columns = [str(column).strip() for column in table.columns]
+        if len(table.columns) == 0:
+            continue
+        date_header = table.columns[0]
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\s*\(\s*%\s*\)", date_header)
+        if match:
+            break
+    else:
+        raise ValueError("Не найден заголовок с датой таблицы ChinaBond.")
+
+    actual_date = pd.Timestamp(match.group(1))
+    if requested_date is not None and actual_date != pd.Timestamp(requested_date):
+        raise ValueError(
+            f"Запрошена дата {requested_date}, но ChinaBond вернула "
+            f"{actual_date:%Y-%m-%d}."
+        )
+
+    missing = [column for column in MATURITIES if column not in table.columns]
+    if missing:
+        raise ValueError(f"В таблице ChinaBond отсутствуют сроки: {missing}.")
+    if table.empty:
+        raise ValueError(f"ChinaBond: нет опубликованных данных на {actual_date:%Y-%m-%d}.")
+
+    maturities = [
+        column for column in table.columns
+        if re.fullmatch(r"\d+(?:\.\d+)?[MY]", column)
+    ]
+    df = table.rename(columns={date_header: "Curve"})[["Curve", *maturities]].copy()
+    df["Curve"] = df["Curve"].astype("string").str.replace(r"\s+", " ", regex=True).str.strip()
+
+    df = df.loc[df["Curve"].eq(GOVERNMENT_CURVE), maturities].copy()
+    if df.empty:
+        raise ValueError(f"Кривая {GOVERNMENT_CURVE} не найдена в ответе ChinaBond.")
+    if len(df) != 1:
+        raise ValueError(f"В ответе ChinaBond обнаружены дубликаты {GOVERNMENT_CURVE}.")
+
+    df[maturities] = df[maturities].apply(pd.to_numeric, errors="raise").astype(float)
+    if df[maturities].isna().all(axis=1).any():
+        raise ValueError(f"Кривая {GOVERNMENT_CURVE} не содержит ставок.")
+
+    df.index = pd.DatetimeIndex([actual_date], name="Date")
+    return df
+
+
+def parse_chinabond(
+    date: Optional[str] = None,
+    timeout: float = 90,
+    proxy_url: Optional[str] = None,
+) -> pd.DataFrame:
+    """Получить ChinaBond Government Bond Yield Curve за выбранную дату.
+
+    date=None: основная страница, фактическая дата из заголовка таблицы.
+    date задана: POST queryGjqxInfo с параметрами workTime и locale=en_US.
+    proxy_url=None: системный HTTPS-прокси из urllib.request.getproxies().
+    Результат: DatetimeIndex Date и числовые столбцы сроков, ставки в процентах.
+    """
+    requested_date = None
+    if date is None:
+        url = PAGE_URL
+        method = "GET"
+    else:
+        timestamp = pd.Timestamp(date)
+        if pd.isna(timestamp):
+            raise ValueError("Не указана корректная дата.")
+        requested_date = timestamp.strftime("%Y-%m-%d")
+        params = urlencode({"workTime": requested_date, "locale": "en_US"})
+        url = f"{QUERY_URL}?{params}"
+        method = "POST"
+
+    html = download_chinabond_html(
+        url, method=method, proxy_url=proxy_url, timeout=timeout,
+    )
+    return _parse_html(html, requested_date=requested_date)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--date", help="Дата YYYY-MM-DD; по умолчанию актуальная таблица")
+    parser.add_argument("--output", type=Path, help="Путь для сохранения CSV")
+    parser.add_argument("--timeout", type=float, default=90, help="Тайм-аут в секундах")
+    parser.add_argument("--proxy", help="Адрес прокси, если его нужно задать явно")
+    args = parser.parse_args()
+
+    data = parse_chinabond(args.date, timeout=args.timeout, proxy_url=args.proxy)
+    output = args.output or Path(f"chinabond_{data.index[0]:%Y-%m-%d}.csv")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(output, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    print(data.to_string())
+    print(f"\nКривая {GOVERNMENT_CURVE} сохранена в {output}")

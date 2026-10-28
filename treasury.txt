@@ -1,0 +1,206 @@
+"""Парсер Daily Treasury Par Yield Curve Rates через корпоративный прокси Windows.
+
+Установка:
+    python -m pip install pandas lxml
+
+Запуск:
+    python treasury_parser.py --year 2026 --output treasury_2026.csv
+
+Использование в Python:
+    from treasury_parser import parse_treasury
+    df = parse_treasury(2026)
+
+Индекс результата — Date (DatetimeIndex), столбцы — сроки погашения.
+Ставки сохраняются в процентах: 4.19 означает 4.19%, а не 0.0419.
+Пропущенные ставки сохраняются как NaN.
+Загрузка использует powershell.exe и учётные данные текущего пользователя
+Windows для аутентификации на прокси. HTML передаётся через Base64 без файлов.
+"""
+
+import argparse
+import base64
+import binascii
+import os
+import re
+import subprocess
+import urllib.request
+from io import StringIO
+from pathlib import Path
+from urllib.parse import urlencode
+
+import pandas as pd
+
+
+BASE_URL = (
+    "https://home.treasury.gov/resource-center/"
+    "data-chart-center/interest-rates/TextView"
+)
+
+
+PS_SCRIPT = r"""
+$ErrorActionPreference = "Stop";
+$ProgressPreference = "SilentlyContinue";
+
+# Поддержка TLS 1.2 в Windows PowerShell с прежними настройками .NET.
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.ServicePointManager]::SecurityProtocol -bor
+    [System.Net.SecurityProtocolType]::Tls12
+);
+
+$proxy = [System.Net.WebProxy]::new($env:TREASURY_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+$client.Headers["User-Agent"] = "Mozilla/5.0";
+$client.Headers["Accept"] = "text/html";
+
+try {
+    $bytes = $client.DownloadData($env:TREASURY_URL);
+    [Console]::Out.Write([Convert]::ToBase64String($bytes));
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message);
+    exit 1;
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+def download_treasury_html(
+    url: str,
+    proxy_url: str = None,
+    timeout: float = 90,
+) -> str:
+    """Загрузить HTML через системный HTTPS-прокси и Windows PowerShell."""
+    if timeout <= 0:
+        raise ValueError("timeout должен быть больше нуля.")
+
+    if proxy_url is None:
+        proxy_url = urllib.request.getproxies().get("https")
+    if not proxy_url:
+        raise RuntimeError("Корпоративный HTTPS-прокси не найден.")
+
+    env = os.environ.copy()
+    env["TREASURY_PROXY"] = proxy_url
+    env["TREASURY_URL"] = url
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-Command", PS_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "powershell.exe не найден. Загрузка рассчитана на Windows PowerShell."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Превышено время загрузки Treasury через прокси ({timeout} с)."
+        ) from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"код завершения {result.returncode}"
+        raise RuntimeError(f"Ошибка подключения Treasury через прокси: {detail}")
+
+    encoded = result.stdout.strip()
+    if not encoded:
+        raise ValueError("Treasury вернула пустой ответ.")
+
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("PowerShell вернул некорректный Base64.") from exc
+
+    if not raw:
+        raise ValueError("Treasury вернула пустой HTML.")
+
+    return raw.decode("utf-8-sig")
+
+
+def _parse_html(html: str, year: int) -> pd.DataFrame:
+    """Выделить кривую доходности из HTML и проверить результат."""
+    try:
+        tables = pd.read_html(
+            StringIO(html), match="Date", flavor="lxml",
+            na_values=["N/A", "n/a", "—", "-"],
+        )
+    except ValueError as exc:
+        raise ValueError("Таблица ставок не найдена: проверьте год и ответ сайта.") from exc
+
+    for table in tables:
+        table.columns = [str(column).strip() for column in table.columns]
+        # Регистр существенен: скрытые 20 YR / 30 YR относятся к другому набору.
+        maturities = [
+            column for column in table.columns
+            if re.fullmatch(r"\d+(?:\.\d+)? (?:Mo|Yr)", column)
+        ]
+        if "Date" in table.columns and maturities:
+            df = table[["Date", *maturities]].copy()
+            break
+    else:
+        raise ValueError("Столбцы кривой доходности не найдены в HTML.")
+
+    df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="raise")
+    df = df.set_index("Date").sort_index()
+    df = df.apply(pd.to_numeric, errors="raise").astype(float)
+
+    if df.empty:
+        raise ValueError(f"Нет опубликованных данных за {year} год.")
+    if not (df.index.year == year).all():
+        raise ValueError(f"Сайт вернул даты за другой год вместо {year}.")
+    if df.index.has_duplicates:
+        raise ValueError("В таблице обнаружены повторяющиеся даты.")
+    if df.isna().all(axis=1).any():
+        raise ValueError("В таблице есть даты без единой ставки: проверьте ответ сайта.")
+
+    return df
+
+
+def parse_treasury(
+    year: int = 2026,
+    timeout: float = 90,
+    proxy_url: str = None,
+) -> pd.DataFrame:
+    """Загрузить ставки за выбранный год через корпоративный прокси Windows.
+
+    Для прошлых лет, перенесённых Treasury в архив, может потребоваться
+    отдельный архивный адрес. proxy_url позволяет задать прокси явно;
+    по умолчанию используется urllib.request.getproxies()["https"].
+    """
+    if isinstance(year, bool) or not isinstance(year, int) or not 1 <= year <= 9999:
+        raise ValueError("year должен быть целым числом от 1 до 9999.")
+
+    params = urlencode({
+        "type": "daily_treasury_yield_curve",
+        "field_tdr_date_value": year,
+    })
+    html = download_treasury_html(
+        f"{BASE_URL}?{params}", proxy_url=proxy_url, timeout=timeout,
+    )
+    return _parse_html(html, year)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--year", type=int, default=2026, help="Год, по умолчанию 2026")
+    parser.add_argument("--output", type=Path, help="Путь для сохранения CSV")
+    parser.add_argument("--timeout", type=float, default=90, help="Тайм-аут в секундах")
+    parser.add_argument("--proxy", help="Адрес прокси, если его нужно задать явно")
+    args = parser.parse_args()
+
+    data = parse_treasury(args.year, timeout=args.timeout, proxy_url=args.proxy)
+    output = args.output or Path(f"treasury_{args.year}.csv")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(output, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    print(data.tail().to_string())
+    print(f"\nСохранено {len(data)} строк и {len(data.columns)} сроков в {output}")

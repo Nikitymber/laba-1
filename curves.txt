@@ -1,0 +1,243 @@
+"""Загрузить данные четырёх парсеров на дату и записать в «Кривые.xlsx».
+
+Положите рядом:
+    treasury_parser.py, chinabond_parser.py, cbr_kbd_parser.py, ruonia_parser.py
+
+Установка:
+    python -m pip install pandas lxml openpyxl
+
+Запуск:
+    python update_curves.py --date 2026-10-13
+    python update_curves.py --date 2026-10-13 --file "C:/Reports/Кривые.xlsx"
+    python update_curves.py --date 2026-10-13 --only ruonia
+
+В существующих листах ожидаются заголовки в строке 1 и дата в колонке A.
+При каждом запуске строка добавляется после последней записи на листе,
+даже если такая дата уже есть. Данные всех выбранных источников загружаются до
+записи: при ошибке источника или сохранения исходный файл не заменяется.
+Ставки сохраняются в процентах, как в парсерах. Date у RUONIA — дата ставки;
+PublicationDate остаётся отдельным столбцом. Автопоиска предыдущей даты нет.
+"""
+
+import argparse
+import importlib
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional, Sequence
+
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+
+# =====================================================
+# 1. НАСТРОЙКИ
+# =====================================================
+
+REPORT_DATE = "2026-10-13"
+WORKBOOK_PATH = Path(__file__).resolve().with_name("Кривые.xlsx")
+
+SHEET_NAMES = {
+    "ruonia": "Динамика RUONIA",
+    "cbr_kbd": "КБД RUB",
+    "treasury": "КБД USD",
+    "chinabond": "КБД CNY",
+}
+
+PARSERS = {
+    "ruonia": ("ruonia_parser", "parse_ruonia"),
+    "cbr_kbd": ("cbr_kbd_parser", "parse_cbr_kbd"),
+    "treasury": ("treasury_parser", "parse_treasury"),
+    "chinabond": ("chinabond_parser", "parse_chinabond"),
+}
+
+
+def _date(value) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        raise ValueError("Укажите корректную отчётную дату.")
+    return pd.Timestamp(timestamp.date())
+
+
+def _select_date(frame: pd.DataFrame, target: pd.Timestamp, source: str) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or not isinstance(frame.index, pd.DatetimeIndex):
+        raise ValueError(f"{source}: парсер должен вернуть DataFrame с DatetimeIndex.")
+    if frame.columns.has_duplicates or len(frame.columns) == 0:
+        raise ValueError(f"{source}: некорректные столбцы результата.")
+    result = frame.loc[frame.index.normalize() == target].copy()
+    if result.empty:
+        raise ValueError(f"{source}: нет данных на {target:%Y-%m-%d}.")
+    if len(result) != 1:
+        raise ValueError(f"{source}: несколько записей на {target:%Y-%m-%d}.")
+    result.index = pd.DatetimeIndex([target], name="Date")
+    return result
+
+
+# =====================================================
+# 2. ВЫЗОВ ПАРСЕРОВ
+# =====================================================
+
+def load_data(
+    report_date: str,
+    sources: Optional[Sequence[str]] = None,
+    proxy_url: Optional[str] = None,
+    timeout: float = 90,
+) -> dict:
+    target = _date(report_date)
+    selected = list(SHEET_NAMES if sources is None else sources)
+    if not selected or len(set(selected)) != len(selected):
+        raise ValueError("Нужен непустой список источников без повторов.")
+    unknown = [source for source in selected if source not in PARSERS]
+    if unknown:
+        raise ValueError(f"Неизвестные источники: {unknown}.")
+    names = [SHEET_NAMES[source] for source in selected]
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("В SHEET_NAMES указаны совпадающие имена листов.")
+
+    frames, errors = {}, []
+    for source in selected:
+        print(f"Загрузка {source} на {target:%Y-%m-%d}...")
+        try:
+            module_name, function_name = PARSERS[source]
+            function = getattr(importlib.import_module(module_name), function_name)
+            kwargs = {"proxy_url": proxy_url, "timeout": timeout}
+            # Treasury загружает год: выбираем из него строго отчётную дату.
+            if source == "treasury":
+                frame = function(target.year, **kwargs)
+            else:
+                frame = function(target.strftime("%Y-%m-%d"), **kwargs)
+            frames[source] = _select_date(frame, target, source)
+        except Exception as exc:
+            errors.append(f"{source}: {exc}")
+
+    if errors:
+        raise RuntimeError("Файл не обновлён. Ошибки загрузки:\n" + "\n".join(errors))
+    return frames
+
+
+# =====================================================
+# 3. ДОБАВЛЕНИЕ ПОСЛЕ ПОСЛЕДНЕЙ ЗАПИСИ
+# =====================================================
+
+def _last_data_row(worksheet, column_count: int) -> int:
+    """Последняя строка со значениями; пустое форматирование не считается записью."""
+    for row in range(worksheet.max_row, 0, -1):
+        if any(worksheet.cell(row, column).value is not None for column in range(1, column_count + 1)):
+            return row
+    return 0
+
+
+def _excel_value(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _write_sheet(workbook, source: str, frame: pd.DataFrame) -> None:
+    sheet_name = SHEET_NAMES[source]
+    worksheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.create_sheet(sheet_name)
+    if worksheet.protection.sheet:
+        raise ValueError(f"Лист «{sheet_name}» защищён от изменений.")
+
+    headers = [worksheet.cell(1, col).value for col in range(1, worksheet.max_column + 1)]
+    if not any(value is not None for value in headers):
+        headers = ["Date", *frame.columns.tolist()]
+        for col, header in enumerate(headers, 1):
+            worksheet.cell(1, col, header)
+    else:
+        if str(headers[0]).strip() not in {"Date", "Дата", "Дата ставки"}:
+            raise ValueError(f"Лист «{sheet_name}»: в A1 должен быть заголовок Date или Дата.")
+        normalized = [str(value).strip() if value is not None else None for value in headers]
+        populated = [value for value in normalized if value is not None]
+        if len(set(populated)) != len(populated):
+            raise ValueError(f"Лист «{sheet_name}»: повторяются заголовки столбцов.")
+        headers = normalized
+        for column in frame.columns:
+            if column not in headers:
+                headers.append(column)
+                worksheet.cell(1, len(headers), column)
+
+    positions = {header: col for col, header in enumerate(headers, 1) if header is not None}
+    target = frame.index[0]
+    row = _last_data_row(worksheet, len(headers)) + 1
+    date_cell = worksheet.cell(row, 1, target.to_pydatetime())
+    date_cell.number_format = "dd.mm.yyyy"
+    for column, value in frame.iloc[0].items():
+        cell = worksheet.cell(row, positions[column])
+        cell.value = _excel_value(value)
+        if isinstance(cell.value, str):
+            cell.data_type = "s"
+        if column == "PublicationDate":
+            cell.number_format = "dd.mm.yyyy"
+        elif column in {"DealsCount", "ParticipantsCount"}:
+            cell.number_format = "0"
+        elif isinstance(cell.value, (int, float)):
+            cell.number_format = "0.0000" if source == "chinabond" else "0.00"
+
+    for col in range(1, len(headers) + 1):
+        header_cell = worksheet.cell(1, col)
+        header_cell.font = Font(bold=True, color="FFFFFF")
+        header_cell.fill = PatternFill("solid", fgColor="17365D")
+        header_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        worksheet.column_dimensions[get_column_letter(col)].width = 16 if col == 1 else max(12, min(24, len(str(headers[col - 1])) + 2))
+    worksheet.row_dimensions[1].height = 32
+    worksheet.freeze_panes = "B2"
+    worksheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row}"
+
+
+def update_curves(
+    report_date: str = REPORT_DATE,
+    workbook_path=WORKBOOK_PATH,
+    *,
+    sources: Optional[Sequence[str]] = None,
+    proxy_url: Optional[str] = None,
+    timeout: float = 90,
+) -> dict:
+    """Загрузить выбранные источники и добавить по строке в конец каждого листа."""
+    path = Path(workbook_path).expanduser().resolve()
+    if path.suffix.lower() != ".xlsx":
+        raise ValueError("Нужен путь к файлу .xlsx.")
+    frames = load_data(report_date, sources=sources, proxy_url=proxy_url, timeout=timeout)
+    created = not path.exists()
+    workbook = Workbook() if created else load_workbook(path)
+    temporary_path = None
+    try:
+        if created:
+            workbook.remove(workbook.active)
+        for source, frame in frames.items():
+            _write_sheet(workbook, source, frame)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Временный файл находится в том же каталоге для атомарной замены.
+        with tempfile.NamedTemporaryFile(prefix="curves_", suffix=".xlsx", dir=path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        workbook.save(temporary_path)
+        workbook.close()
+        os.replace(temporary_path, path)
+    except PermissionError as exc:
+        raise PermissionError(f"Не удалось записать {path}. Закройте книгу в Excel и проверьте права на каталог.") from exc
+    finally:
+        workbook.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    print(f"Обновлён файл: {path}")
+    for source in frames:
+        print(f"  {source} → {SHEET_NAMES[source]}")
+    return frames
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--date", default=REPORT_DATE, help="Дата YYYY-MM-DD")
+    parser.add_argument("--file", type=Path, default=WORKBOOK_PATH, help="Путь к Кривые.xlsx")
+    parser.add_argument("--only", nargs="+", choices=list(PARSERS), help="Обновить только указанные источники")
+    parser.add_argument("--proxy", help="Явно заданный корпоративный прокси")
+    parser.add_argument("--timeout", type=float, default=90, help="Тайм-аут одного запроса в секундах")
+    args = parser.parse_args()
+    update_curves(args.date, args.file, sources=args.only, proxy_url=args.proxy, timeout=args.timeout)

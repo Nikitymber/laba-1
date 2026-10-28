@@ -1,0 +1,284 @@
+"""Ставка RUONIA и параметры расчёта с сайта Банка России.
+
+Установка:
+    python -m pip install pandas lxml
+
+Использование:
+    from ruonia_parser import parse_ruonia
+    df = parse_ruonia("2026-10-13")
+    latest = parse_ruonia()
+    history = parse_ruonia(start="2026-10-01", end="2026-10-13")
+    rate_only = history[["RUONIA"]]
+
+Запуск:
+    python ruonia_parser.py --date 2026-10-13 --output ruonia.csv
+    python ruonia_parser.py --start 2026-10-01 --end 2026-10-13
+
+Источник: https://www.cbr.ru/hd_base/ruonia/dynamics/
+Индекс Date — дата ставки, а PublicationDate — дата публикации.
+RUONIA, MinRate, Percentile25, Percentile75, MaxRate — проценты годовых.
+VolumeBlnRUB — объём сделок в млрд рублей. DealsCount, ParticipantsCount —
+количество сделок и участников (целые с возможными пропусками).
+CalculationStatus — статус расчёта. Пропуски сохраняются как NaN/NA/NaT.
+При отсутствии данных за период возникает ValueError; даты не подменяются.
+Загрузка: Windows PowerShell, корпоративный HTTPS-прокси и учётные данные
+текущего пользователя Windows. Ответ передаётся через Base64 без файлов.
+"""
+
+import argparse
+import base64
+import binascii
+import os
+import re
+import subprocess
+import urllib.request
+from io import StringIO
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlencode
+
+import pandas as pd
+
+
+BASE_URL = "https://www.cbr.ru/hd_base/ruonia/dynamics/"
+HEADER_MAP = {
+    "Дата ставки": "Date",
+    "Ставка RUONIA, % годовых": "RUONIA",
+    "Объем сделок RUONIA, млрд руб.": "VolumeBlnRUB",
+    "Количество сделок, ед.": "DealsCount",
+    "Количество участников RUONIA, совершавших сделки в данный день, ед.": "ParticipantsCount",
+    "Минимальная процентная ставка, % годовых": "MinRate",
+    "25-й процентиль по процентным ставкам, % годовых": "Percentile25",
+    "75-й процентиль по процентным ставкам, % годовых": "Percentile75",
+    "Максимальная процентная ставка, % годовых": "MaxRate",
+    "Статус расчета": "CalculationStatus",
+    "Дата публикации": "PublicationDate",
+}
+FLOAT_COLUMNS = [
+    "RUONIA", "VolumeBlnRUB", "MinRate", "Percentile25", "Percentile75", "MaxRate",
+]
+COUNT_COLUMNS = ["DealsCount", "ParticipantsCount"]
+
+
+PS_SCRIPT = r"""
+$ErrorActionPreference = "Stop";
+$ProgressPreference = "SilentlyContinue";
+
+[System.Net.ServicePointManager]::SecurityProtocol = (
+    [System.Net.ServicePointManager]::SecurityProtocol -bor
+    [System.Net.SecurityProtocolType]::Tls12
+);
+
+$proxy = [System.Net.WebProxy]::new($env:RUONIA_PROXY);
+$proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials;
+
+$client = [System.Net.WebClient]::new();
+$client.Proxy = $proxy;
+$client.Headers["User-Agent"] = "Mozilla/5.0";
+$client.Headers["Accept"] = "text/html";
+
+try {
+    $bytes = $client.DownloadData($env:RUONIA_URL);
+    [Console]::Out.Write([Convert]::ToBase64String($bytes));
+}
+catch {
+    [Console]::Error.WriteLine($_.Exception.Message);
+    exit 1;
+}
+finally {
+    $client.Dispose();
+}
+"""
+
+
+def download_ruonia_html(
+    url: str,
+    proxy_url: Optional[str] = None,
+    timeout: float = 90,
+) -> str:
+    """Загрузить HTML через корпоративный HTTPS-прокси с авторизацией Windows."""
+    if timeout <= 0:
+        raise ValueError("timeout должен быть больше нуля.")
+    if proxy_url is None:
+        proxy_url = urllib.request.getproxies().get("https")
+    if not proxy_url:
+        raise RuntimeError("Корпоративный HTTPS-прокси не найден.")
+
+    env = os.environ.copy()
+    env["RUONIA_PROXY"] = proxy_url
+    env["RUONIA_URL"] = url
+
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-Command", PS_SCRIPT,
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "powershell.exe не найден. Загрузка рассчитана на Windows PowerShell."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"Превышено время загрузки RUONIA через прокси ({timeout} с)."
+        ) from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"код завершения {result.returncode}"
+        raise RuntimeError(f"Ошибка подключения к Банку России через прокси: {detail}")
+
+    encoded = result.stdout.strip()
+    if not encoded:
+        raise ValueError("Банк России вернул пустой ответ.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("PowerShell вернул некорректный Base64.") from exc
+    if not raw:
+        raise ValueError("Банк России вернул пустой HTML.")
+    return raw.decode("utf-8-sig")
+
+
+def _parse_html(html: str) -> pd.DataFrame:
+    """Разобрать таблицу, сохранив даты публикации и исторические пропуски."""
+    try:
+        tables = pd.read_html(
+            StringIO(html),
+            flavor="lxml",
+            decimal=",",
+            thousands=None,
+            na_values=["N/A", "n/a", "—", "-", "--"],
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "Таблица RUONIA не найдена: проверьте наличие данных за выбранный "
+            "период и ответ сайта или прокси."
+        ) from exc
+
+    for table in tables:
+        columns = [
+            re.sub(r"\s+", " ", str(c[-1] if isinstance(c, tuple) else c)).strip()
+            for c in table.columns
+        ]
+        if "Дата ставки" in columns:
+            table.columns = columns
+            break
+    else:
+        raise ValueError("Не найдена таблица RUONIA с колонкой «Дата ставки».")
+
+    if table.columns.has_duplicates:
+        raise ValueError("В таблице RUONIA обнаружены повторяющиеся столбцы.")
+    missing = [column for column in HEADER_MAP if column not in table.columns]
+    if missing:
+        raise ValueError(f"В таблице RUONIA отсутствуют поля: {missing}.")
+    if table.empty:
+        raise ValueError("Банк России не опубликовал RUONIA за запрошенный период.")
+
+    df = table[list(HEADER_MAP)].rename(columns=HEADER_MAP).copy()
+    for column in ["Date", "PublicationDate"]:
+        df[column] = pd.to_datetime(df[column], format="%d.%m.%Y", errors="raise")
+    if df["Date"].isna().any():
+        raise ValueError("В таблице RUONIA есть запись без даты ставки.")
+
+    for column in FLOAT_COLUMNS + COUNT_COLUMNS:
+        values = (
+            df[column].astype("string")
+            .str.replace(r"\s+", "", regex=True)
+            .str.replace(",", ".", regex=False)
+        )
+        dtype = "Int64" if column in COUNT_COLUMNS else float
+        df[column] = pd.to_numeric(values, errors="raise").astype(dtype)
+
+    df["CalculationStatus"] = (
+        df["CalculationStatus"].astype("string")
+        .str.replace(r"\s+", " ", regex=True).str.strip()
+    )
+    df = df.set_index("Date").sort_index()
+    if df.index.has_duplicates:
+        raise ValueError("В таблице RUONIA обнаружены повторяющиеся даты ставки.")
+    if df["RUONIA"].isna().all():
+        raise ValueError("В таблице нет опубликованных значений ставки RUONIA.")
+    return df
+
+
+def _date(value: str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        raise ValueError("Не указана корректная дата.")
+    return pd.Timestamp(timestamp.date())
+
+
+def parse_ruonia(
+    date: Optional[str] = None,
+    *,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    proxy_url: Optional[str] = None,
+    timeout: float = 90,
+) -> pd.DataFrame:
+    """Получить RUONIA на дату ставки, за период включительно или последнюю запись.
+
+    date, start, end — даты ставки, а не даты её публикации.
+    Без дат возвращается одна последняя опубликованная запись с сайта.
+    Для диапазона нужны оба параметра start и end. Даты — YYYY-MM-DD.
+    Если записей за период нет, возникает ValueError.
+    """
+    if date is not None and (start is not None or end is not None):
+        raise ValueError("Укажите либо date, либо диапазон start и end.")
+
+    if date is not None:
+        lower = upper = _date(date)
+    elif start is not None or end is not None:
+        if start is None or end is None:
+            raise ValueError("Для диапазона нужно указать и start, и end.")
+        lower, upper = _date(start), _date(end)
+        if lower > upper:
+            raise ValueError("start не может быть позже end.")
+    else:
+        lower = upper = None
+
+    url = BASE_URL
+    if lower is not None:
+        url += "?" + urlencode({
+            "UniDbQuery.Posted": "True",
+            "UniDbQuery.From": lower.strftime("%d.%m.%Y"),
+            "UniDbQuery.To": upper.strftime("%d.%m.%Y"),
+        })
+
+    html = download_ruonia_html(url, proxy_url=proxy_url, timeout=timeout)
+    df = _parse_html(html)
+    if lower is None:
+        return df.tail(1).copy()
+    if not ((df.index >= lower) & (df.index <= upper)).all():
+        raise ValueError("Банк России вернул даты ставки за пределами запрошенного периода.")
+    return df
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--date", help="Дата ставки YYYY-MM-DD")
+    parser.add_argument("--start", help="Начало периода YYYY-MM-DD")
+    parser.add_argument("--end", help="Конец периода YYYY-MM-DD")
+    parser.add_argument("--output", type=Path, help="Путь для сохранения CSV")
+    parser.add_argument("--timeout", type=float, default=90, help="Тайм-аут в секундах")
+    parser.add_argument("--proxy", help="Адрес прокси, если его нужно задать явно")
+    args = parser.parse_args()
+
+    data = parse_ruonia(
+        args.date, start=args.start, end=args.end,
+        proxy_url=args.proxy, timeout=args.timeout,
+    )
+    suffix = f"{data.index[0]:%Y-%m-%d}"
+    if len(data) > 1:
+        suffix += f"_{data.index[-1]:%Y-%m-%d}"
+    output = args.output or Path(f"ruonia_{suffix}.csv")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    data.to_csv(output, encoding="utf-8-sig", date_format="%Y-%m-%d")
+    print(data.to_string())
+    print(f"\nСохранено {len(data)} дат ставки RUONIA в {output}")
