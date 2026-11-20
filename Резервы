@@ -1,5 +1,7 @@
 import pandas as pd
 
+file_path = r"781-П резервы.xlsx"
+rep_dt = pd.to_datetime(report_date, dayfirst=True)
 currencies = ["RUB", "EUR", "USD", "CNY"]
 
 raw = pd.read_excel(
@@ -7,35 +9,44 @@ raw = pd.read_excel(
     sheet_name="ДПУ_жизнь",
     usecols="BQ:DE",
     header=None,
+    keep_default_na=False,
 )
 
-# Находим строку, в которой больше всего ячеек с кодами валют
+# Ищем первую строку, где хотя бы две ячейки содержат коды валют,
+# а остальные ячейки пусты или тоже содержат коды валют.
 labels = raw.apply(lambda col: col.astype("string").str.strip().str.upper())
-currency_counts = labels.isin(currencies).sum(axis=1)
+blank_cells = labels.fillna("").eq("")
+is_currency = labels.isin(currencies)
 
-if not currency_counts.any():
-    raise ValueError("На листе «ДПУ_жизнь» в диапазоне BQ:DE не найдены валюты.")
+header_rows = (
+    (is_currency.sum(axis=1) >= 2)
+    & (is_currency | blank_cells).all(axis=1)
+)
 
-currency_row = currency_counts.idxmax()
-codes = labels.loc[currency_row]
-keep = codes.isin(currencies)
+if not header_rows.any():
+    raise ValueError("На листе «ДПУ_жизнь» в BQ:DE не найдена строка с валютами.")
 
-# +1 — строка итогов, +2 — первый месяц
-amounts = raw.loc[currency_row + 2:, keep].copy()
-amounts.columns = codes[keep].tolist()
-amounts = amounts.apply(pd.to_numeric, errors="raise")
+currency_row = header_rows.idxmax()
+keep = is_currency.loc[currency_row]
 
-# Убираем пустые строки в конце. Пустой месяц внутри таблицы сохраняет свою дату.
-last_row = amounts.last_valid_index()
-amounts = amounts.loc[:last_row] if last_row is not None else amounts.iloc[:0]
+# Сразу под валютами расположен итог, ещё на одну строку ниже — первый месяц.
+start = currency_row + 2
 
-# Для каждого месяца складываем значения всех колонок одной валюты
+# Конец таблицы — первая полностью пустая строка после начала данных.
+blank_rows = blank_cells.iloc[start:].all(axis=1)
+stop = blank_rows.idxmax() if blank_rows.any() else len(raw)
+
+rows = raw.iloc[start:stop].mask(blank_cells.iloc[start:stop])
+amounts = rows.loc[:, keep].apply(pd.to_numeric, errors="raise")
+amounts.columns = labels.loc[currency_row, keep].tolist()
+
+# Для каждого месяца складываем все колонки одной валюты.
 df_dpu_life = pd.DataFrame({
     currency: amounts.loc[:, amounts.columns == currency].sum(axis=1, min_count=1)
     for currency in currencies
 })
 
-# Первая дата — конец следующего месяца после rep_dt
+# Первая дата — конец месяца, следующего за отчётным.
 df_dpu_life.index = pd.date_range(
     start=rep_dt + pd.DateOffset(months=1),
     periods=len(df_dpu_life),
