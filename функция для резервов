@@ -1,0 +1,63 @@
+import pandas as pd
+
+file_path = r"781-П резервы.xlsx"
+rep_dt = pd.to_datetime(report_date, dayfirst=True)
+
+
+def read_dpu_table(excel, usecols, rep_dt):
+    currencies = ["RUB", "EUR", "USD", "CNY"]
+
+    raw = excel.parse(
+        sheet_name="ДПУ_жизнь",
+        usecols=usecols,
+        header=None,
+        keep_default_na=False,
+    )
+
+    # Находим строку с кодами валют
+    labels = raw.apply(lambda col: col.astype("string").str.strip().str.upper())
+    blank_cells = labels.fillna("").eq("")
+    is_currency = labels.isin(currencies)
+
+    header_rows = (
+        (is_currency.sum(axis=1) >= 2)
+        & (is_currency | blank_cells).all(axis=1)
+    )
+    if not header_rows.any():
+        raise ValueError(f"На листе «ДПУ_жизнь» в {usecols} не найдена строка с валютами.")
+
+    currency_row = header_rows.idxmax()
+    keep = is_currency.loc[currency_row]
+
+    # Сразу под валютами расположен итог, ещё на строку ниже — первый месяц
+    start = currency_row + 2
+    blank_rows = blank_cells.iloc[start:].all(axis=1)
+    stop = blank_rows.idxmax() if blank_rows.any() else len(raw)
+
+    rows = raw.iloc[start:stop].mask(blank_cells.iloc[start:stop])
+    amounts = rows.loc[:, keep].apply(pd.to_numeric, errors="raise")
+    amounts.columns = labels.loc[currency_row, keep].tolist()
+
+    # Складываем суммы одного месяца по всем колонкам одной валюты
+    result = pd.DataFrame({
+        currency: amounts.loc[:, amounts.columns == currency].sum(axis=1, min_count=1)
+        for currency in currencies
+    })
+
+    # Первая дата — конец месяца, следующего за отчётным
+    result.index = pd.date_range(
+        start=rep_dt + pd.DateOffset(months=1),
+        periods=len(result),
+        freq=pd.offsets.MonthEnd(),
+        normalize=True,
+        name="Дата",
+    )
+    return result.reset_index()
+
+
+with pd.ExcelFile(file_path) as excel:
+    df_dpu_life = read_dpu_table(excel, "BQ:DE", rep_dt)
+    df_dpu_life_jy_lm = read_dpu_table(excel, "JY:LM", rep_dt)
+
+# Первые строки второй таблицы
+display(df_dpu_life_jy_lm.head().style.format({"Дата": "{:%d.%m.%Y}"}, na_rep=""))
