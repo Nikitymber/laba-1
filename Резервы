@@ -1,59 +1,33 @@
-import pandas as pd
+terms = pd.to_numeric(df_dpu_life_net["срок"], errors="raise")
+days = pd.to_numeric(liabilities_result["Кол-во дней"], errors="coerce")
+currency = liabilities_result["Валюта"].astype("string").str.strip().str.upper()
 
-file_path = r"781-П резервы.xlsx"
-rep_dt = pd.to_datetime(report_date, dayfirst=True)
-currencies = ["RUB", "EUR", "USD", "CNY"]
-
-raw = pd.read_excel(
-    file_path,
-    sheet_name="ДПУ_жизнь",
-    usecols="BQ:DE",
-    header=None,
-    keep_default_na=False,
+target = (
+    liabilities_result["Линия бизнеса"].astype("string").str.strip().eq("Остальное")
+    & liabilities_result["Активы/Пассивы"].astype("string").str.strip().eq("Пассивы")
 )
 
-# Ищем первую строку, где хотя бы две ячейки содержат коды валют,
-# а остальные ячейки пусты или тоже содержат коды валют.
-labels = raw.apply(lambda col: col.astype("string").str.strip().str.upper())
-blank_cells = labels.fillna("").eq("")
-is_currency = labels.isin(currencies)
+liabilities_result["ДПУ"] = 0.0
 
-header_rows = (
-    (is_currency.sum(axis=1) >= 2)
-    & (is_currency | blank_cells).all(axis=1)
-)
+for code in ["RUB", "EUR", "USD", "CNY"]:
+    rows = target & currency.eq(code) & days.notna()
+    bucket_days = days.loc[rows]
+    if bucket_days.empty:
+        continue
 
-if not header_rows.any():
-    raise ValueError("На листе «ДПУ_жизнь» в BQ:DE не найдена строка с валютами.")
+    # Интервалы заканчиваются на значениях «Кол-во дней» для этой валюты
+    upper_bounds = sorted(bucket_days.unique())
+    bucket = pd.cut(
+        terms,
+        bins=[float("-inf"), *upper_bounds],
+        labels=upper_bounds,
+        right=True,
+    )
 
-currency_row = header_rows.idxmax()
-keep = is_currency.loc[currency_row]
+    # Складываем ДПУ по валюте и записываем итог в строку верхней границы
+    totals = df_dpu_life_net[code].groupby(bucket, observed=True).sum()
+    values = bucket_days.map(totals).fillna(0)
 
-# Сразу под валютами расположен итог, ещё на одну строку ниже — первый месяц.
-start = currency_row + 2
-
-# Конец таблицы — первая полностью пустая строка после начала данных.
-blank_rows = blank_cells.iloc[start:].all(axis=1)
-stop = blank_rows.idxmax() if blank_rows.any() else len(raw)
-
-rows = raw.iloc[start:stop].mask(blank_cells.iloc[start:stop])
-amounts = rows.loc[:, keep].apply(pd.to_numeric, errors="raise")
-amounts.columns = labels.loc[currency_row, keep].tolist()
-
-# Для каждого месяца складываем все колонки одной валюты.
-df_dpu_life = pd.DataFrame({
-    currency: amounts.loc[:, amounts.columns == currency].sum(axis=1, min_count=1)
-    for currency in currencies
-})
-
-# Первая дата — конец месяца, следующего за отчётным.
-df_dpu_life.index = pd.date_range(
-    start=rep_dt + pd.DateOffset(months=1),
-    periods=len(df_dpu_life),
-    freq=pd.offsets.MonthEnd(),
-    normalize=True,
-    name="Дата",
-)
-df_dpu_life = df_dpu_life.reset_index()
-
-display(df_dpu_life.head().style.format({"Дата": "{:%d.%m.%Y}"}, na_rep=""))
+    # Если граница повторяется, записываем сумму только в первую подходящую строку
+    values = values.mask(bucket_days.duplicated(), 0)
+    liabilities_result.loc[rows, "ДПУ"] = values.to_numpy()
