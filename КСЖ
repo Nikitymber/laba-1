@@ -1,0 +1,26 @@
+kszh_frames = []
+
+with pd.ExcelFile(file_path) as excel:
+    for currency in ["RUB", "USD", "CNY", "EUR"]:
+        sheet_name = f"PY_ДП_КСЖ_42204_{currency}"
+        if sheet_name not in excel.sheet_names:
+            continue
+
+        df = excel.parse(sheet_name, header=2).dropna(how="all")
+
+        if "№" in df.columns:
+            number = df["№"].astype("string").str.strip().fillna("")
+            df = df.loc[number.ne("")].copy()
+
+        df["Линия бизнеса"] = "42204"
+        df["Валюта"] = currency
+        kszh_frames.append(df.filter(items=columns_to_keep))
+
+if not kszh_frames:
+    raise ValueError("В книге не найдено ни одного валютного листа PY_ДП_КСЖ_42204.")
+
+df_kszh = pd.concat(kszh_frames, ignore_index=True)
+
+# Собираем df_common заново, чтобы повторный запуск ячейки не дублировал строки
+base_frames = [df.loc[:, columns_to_keep] for df in dp_sheets.values()]
+df_common = pd.concat(base_frames + [df_kszh], ignore_index=True)
