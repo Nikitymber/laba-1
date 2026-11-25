@@ -1,3 +1,35 @@
+"""Чтение файлов ПредДСЖ и выгрузка итогов по эмитентам в Excel."""
+
+import argparse
+import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import pandas as pd
+
+
+FILE_PATTERN = re.compile(r"ПредДСЖ-([0-9]{4}-[0-9]{2}-[0-9]{2})\.(?i:xlsx)")
+ISSUER_COLUMN = "Наименование эмитента"
+ASSET_TYPE_COLUMN = "Тип ФВ(акция/облигация/депозит и т.д.)"
+GROUP_COLUMNS = ["Дата", ISSUER_COLUMN, ASSET_TYPE_COLUMN]
+VALUE_COLUMNS = [
+    "fair_value",
+    "Умеренный стресс 1",
+    "Пессимистичный стресс 2",
+]
+COLUMNS = [ISSUER_COLUMN, "ISIN", ASSET_TYPE_COLUMN, *VALUE_COLUMNS]
+
+
+def read_pred_dszh(folder, sheet_name=0, header=0):
+    """Вернуть общую таблицу с датой отчёта из имени каждого файла."""
+    folder = Path(folder)
+    frames = []
+
+    for file_path in sorted(folder.iterdir()):
+        match = FILE_PATTERN.fullmatch(file_path.name)
+        if match is None or not file_path.is_file():
+            continue
+
         try:
             report_date = pd.to_datetime(match.group(1), format="%Y-%m-%d")
             df = pd.read_excel(
