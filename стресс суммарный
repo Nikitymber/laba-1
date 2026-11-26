@@ -12,12 +12,16 @@ FILE_PATTERN = re.compile(r"ПредДСЖ-([0-9]{4}-[0-9]{2}-[0-9]{2})\.(?i:xls
 ISSUER_COLUMN = "Наименование эмитента"
 ASSET_TYPE_COLUMN = "Тип ФВ(акция/облигация/депозит и т.д.)"
 GROUP_COLUMNS = ["Дата", ISSUER_COLUMN, ASSET_TYPE_COLUMN]
-VALUE_COLUMNS = [
-    "fair_value",
+STRESS_COLUMNS = [
     "Умеренный стресс 1",
     "Пессимистичный стресс 2",
 ]
+VALUE_COLUMNS = ["fair_value", *STRESS_COLUMNS]
 COLUMNS = [ISSUER_COLUMN, "ISIN", ASSET_TYPE_COLUMN, *VALUE_COLUMNS]
+STRESS_ASSET_TYPES = {
+    "Облигации": ("облигация", "облигации"),
+    "Акции": ("акция", "акции"),
+}
 
 
 def read_pred_dszh(folder, sheet_name=0, header=0):
@@ -62,39 +66,31 @@ def aggregate_pred_dszh(df_result):
     return grouped[VALUE_COLUMNS].sum(min_count=1)
 
 
+def summarize_stress_by_asset_type(df_agg):
+    """Рассчитать среднее и выборочное СКО дневных сумм по эмитентам."""
+    asset_types = df_agg[ASSET_TYPE_COLUMN].astype("string").str.strip().str.casefold()
+    statistics = {
+        f"{column} — {label}": (column, method)
+        for column in STRESS_COLUMNS
+        for label, method in (("среднее", "mean"), ("СКО", "std"))
+    }
+
+    summaries = {}
+    for sheet_name, type_names in STRESS_ASSET_TYPES.items():
+        rows = df_agg.loc[asset_types.isin(type_names)]
+        daily_groups = rows.groupby(
+            ["Дата", ISSUER_COLUMN], as_index=False, dropna=False, observed=True
+        )
+        daily_stress = daily_groups[STRESS_COLUMNS].sum(min_count=1)
+        issuer_groups = daily_stress.groupby(
+            ISSUER_COLUMN, as_index=False, dropna=False, observed=True
+        )
+        summaries[sheet_name] = issuer_groups.agg(**statistics)
+
+    return summaries
+
+
 def save_pred_dszh_excel(df_agg, folder, *, df_result=None):
-    """Сохранить сводку и переданную детализацию в одну книгу Excel."""
+    """Сохранить агрегацию, статистику стрессов и переданную детализацию."""
     output_path = Path(folder) / "ПредДСЖ_агрегация.xlsx"
-
-    with TemporaryDirectory(dir=output_path.parent) as temp_folder:
-        temp_path = Path(temp_folder) / output_path.name
-        with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-            df_agg.to_excel(writer, sheet_name="Агрегация", index=False)
-            if df_result is not None:
-                df_result.to_excel(writer, sheet_name="Детализация", index=False)
-        temp_path.replace(output_path)
-
-    return output_path
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "folder",
-        nargs="?",
-        type=Path,
-        default=Path(__file__).resolve().parent,
-        help="папка с Excel-файлами (по умолчанию папка со скриптом)",
-    )
-    folder = parser.parse_args().folder
-    df_result = read_pred_dszh(folder)
-    print(df_result.head().to_string(index=False))
-    print(f"Всего строк — {len(df_result)}")
-
-    df_agg = aggregate_pred_dszh(df_result)
-    output_path = save_pred_dszh_excel(df_agg, folder, df_result=df_result)
-    print()
-    print("Сводка по дате, эмитенту и типу ФВ")
-    print(df_agg.head().to_string(index=False))
-    print(f"Всего групп — {len(df_agg)}")
-    print(f"Результаты сохранены в «{output_path}»")
+    stress_summaries = summarize_stress_by_asset_type(df_agg)
