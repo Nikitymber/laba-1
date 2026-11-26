@@ -1,0 +1,29 @@
+import pandas as pd
+
+# Заголовки, по которым определяем строку начала таблицы
+header_cols = (set(keep_to_columns) - {"Валюта", "Линия бизнеса"}) or {"№"}
+
+# На этом этапе df_common содержит данные остальных листов
+frames = [df_common.loc[:, keep_to_columns]]
+
+with pd.ExcelFile(file_path) as excel:
+    sheets_42204 = [name for name in excel.sheet_names if "42204" in name]
+
+    for name in sheets_42204:
+        # Заголовки находятся либо в 3-й, либо в 11-й строке Excel
+        row3 = excel.parse(name, header=None, skiprows=2, nrows=1)
+        header_in_row3 = not row3.empty and header_cols.issubset(row3.iloc[0])
+        header_row = 2 if header_in_row3 else 10
+
+        df = excel.parse(name, header=header_row).dropna(how="all")
+
+        if "№" in df.columns:
+            number = df["№"].astype("string").str.strip().fillna("")
+            df = df.loc[number.ne("")].copy()
+
+        df["Валюта"] = name.rsplit("_", 1)[-1]
+        df["Линия бизнеса"] = "42204"
+
+        frames.append(df.loc[:, keep_to_columns])
+
+df_common = pd.concat(frames, ignore_index=True)
