@@ -1,35 +1,46 @@
 import pandas as pd
 
-frames = [df_common.loc[:, columns_to_keep]]
+suffixes_42204 = (
+    "КСЖ42204_RUB",
+    "КСЖ_42204_RUB",
+    "_ДП_Life_42204_RUB",
+    "_ДП_Life_42204_USD",
+    "_ДП_Life_42204_EUR",
+)
+
+# Включаем обе новые колонки в результат
+result_columns = list(dict.fromkeys([*columns_to_keep, "Линия бизнеса", "Валюта"]))
+frames = [df_common.reindex(columns=result_columns, fill_value=0)]
 
 with pd.ExcelFile(file_path, engine="openpyxl") as excel:
-    sheets_42204 = [name for name in excel.sheet_names if "42204" in name]
+    sheets_42204 = [
+        name for name in excel.sheet_names
+        if name.startswith("ДП")
+        and name.replace(" ", "").endswith(suffixes_42204)
+    ]
 
     for name in sheets_42204:
         ws = excel.book[name]
+        currency = ws["D4"].value
+        business_line = ws["D5"].value
 
-        if ws["B3"].value == "№":
-            header_row = 3
-        elif ws["B11"].value == "№":
-            header_row = 11
-        else:
-            raise ValueError(f"На листе {name!r} в B3 и B11 отсутствует «№»")
+        # Считаем строки данных до первой полностью пустой строки
+        nrows = 0
+        for row in ws.iter_rows(min_row=12, min_col=2, values_only=True):
+            if all(value is None or str(value).strip() == "" for value in row):
+                break
+            nrows += 1
 
-        # Читаем с колонки B и оставляем строки с заполненным номером
-        df = excel.parse(name, header=header_row - 1).iloc[:, 1:]
+        df = excel.parse(name, header=10, nrows=nrows).iloc[:, 1:]
+
+        # Внутри таблицы оставляем строки с заполненным «№»
         number = df["№"].astype("string").str.strip().fillna("")
         df = df.loc[number.ne("")].copy()
 
-        df["Валюта"] = name.rsplit("_", 1)[-1]
-        df["Линия бизнеса"] = "42204"
+        df["Линия бизнеса"] = str(business_line) if business_line is not None else pd.NA
+        df["Валюта"] = "RUB" if currency == "R" else currency
 
-        missing = [col for col in columns_to_keep if col not in df.columns]
-        if missing:
-            raise KeyError(
-                f"Лист {name!r}, строка заголовков {header_row}. "
-                f"Отсутствуют колонки {missing!r}"
-            )
-
-        frames.append(df.loc[:, columns_to_keep])
+        # Отсутствующие колонки заполняем нулями
+        frames.append(df.reindex(columns=result_columns, fill_value=0))
 
 df_common = pd.concat(frames, ignore_index=True)
